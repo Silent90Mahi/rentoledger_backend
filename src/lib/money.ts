@@ -1,7 +1,7 @@
 /**
- * Money helpers. Amounts are stored as NUMERIC(14,2) in Postgres (exact) and
- * handled as rupees in JS. Any arithmetic in JS goes through integer paise to
- * avoid floating point drift.
+ * Money helpers. Amounts are stored and handled as rupees with at most two
+ * decimals. Arithmetic goes through integer paise, and database sums are
+ * rounded to paise, so floating point residue never reaches a balance.
  */
 
 export function toPaise(amount: number): number {

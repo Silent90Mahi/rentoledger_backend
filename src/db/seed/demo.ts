@@ -21,7 +21,7 @@ import { submitPayment } from '../../modules/portal/portal.service.js';
 import { createProperty } from '../../modules/properties/properties.service.js';
 import { createUnit } from '../../modules/units/units.service.js';
 import { runReminderTasks } from '../../jobs/tasks.js';
-import { db } from '../knex.js';
+import { col, newId, withTransaction } from '../mongo.js';
 
 export const DEMO_OWNER_PHONE = '+919876543210';
 export const DEMO_PARTNER_PHONE = '+919876543211';
@@ -33,34 +33,55 @@ export async function seedDemoData(): Promise<void> {
   const monthStartToday = startOfMonth(today);
   const billingStart = addMonths(monthStartToday, -5); // six billed months incl. the current one
 
-  const { owner, account } = await db.transaction(async (trx) => {
-    const [owner] = await trx('users')
-      .insert({ phone: DEMO_OWNER_PHONE, name: 'Vaibhav Dixit', email: 'vaibhav@example.com', last_login_at: new Date() })
-      .returning('*');
-    const [account] = await trx('accounts')
-      .insert({
-        name: 'Dixit Properties',
-        gst_enabled: true,
-        gst_rate: 18,
-        timezone,
-        reminder_days_before: 3,
-        payee_name: 'Vaibhav Dixit',
-        upi_id: 'vaibhav.dixit@okhdfcbank',
-        bank_account_name: 'Vaibhav Dixit',
-        bank_account_number: '50100234567891',
-        bank_ifsc: 'HDFC0001234',
-        bank_name: 'HDFC Bank, Hazratganj',
-      })
-      .returning('*');
-    await trx('account_members').insert({ account_id: account.id, user_id: owner.id, role: 'owner' });
-    const [partner] = await trx('users').insert({ phone: DEMO_PARTNER_PHONE, name: 'Priya Dixit' }).returning('*');
-    await trx('account_members').insert({ account_id: account.id, user_id: partner.id, role: 'partner', invited_by: owner.id });
-    // Tenants who already use the app (so they receive in-app notifications).
-    await trx('users').insert([
-      { phone: DEMO_TENANT_PHONE, name: 'Ayushi Sharma', last_login_at: new Date() },
-      { phone: '+919812345674', name: 'Neha Sharma', last_login_at: new Date() },
-    ]);
-    return { owner, account };
+  const { owner, account } = await withTransaction(async (session) => {
+    const at = new Date();
+    const user = (fields: Record<string, unknown>): Record<string, any> & { _id: string } => ({
+      _id: newId(),
+      email: null,
+      late_rent_notifications: true,
+      last_login_at: null,
+      created_at: at,
+      updated_at: at,
+      ...fields,
+    });
+    const owner = user({ phone: DEMO_OWNER_PHONE, name: 'Vaibhav Dixit', email: 'vaibhav@example.com', last_login_at: at });
+    const account = {
+      _id: newId(),
+      name: 'Dixit Properties',
+      gst_enabled: true,
+      gst_rate: 18,
+      currency: 'INR',
+      timezone,
+      reminder_days_before: 3,
+      payee_name: 'Vaibhav Dixit',
+      upi_id: 'vaibhav.dixit@okhdfcbank',
+      bank_account_name: 'Vaibhav Dixit',
+      bank_account_number: '50100234567891',
+      bank_ifsc: 'HDFC0001234',
+      bank_name: 'HDFC Bank, Hazratganj',
+      created_at: at,
+      updated_at: at,
+    };
+    const partner = user({ phone: DEMO_PARTNER_PHONE, name: 'Priya Dixit' });
+    await col('users').insertMany(
+      [
+        owner,
+        partner,
+        // Tenants who already use the app (so they receive in-app notifications).
+        user({ phone: DEMO_TENANT_PHONE, name: 'Ayushi Sharma', last_login_at: at }),
+        user({ phone: '+919812345674', name: 'Neha Sharma', last_login_at: at }),
+      ],
+      { session },
+    );
+    await col('accounts').insertOne(account, { session });
+    await col('account_members').insertMany(
+      [
+        { _id: newId(), account_id: account._id, user_id: owner._id, role: 'owner', invited_by: null, created_at: at },
+        { _id: newId(), account_id: account._id, user_id: partner._id, role: 'partner', invited_by: owner._id, created_at: at },
+      ],
+      { session },
+    );
+    return { owner: { id: owner._id, name: owner.name as string }, account: { id: account._id, name: account.name } };
   });
 
   const ctx: Ctx = {
@@ -270,11 +291,12 @@ export async function seedDemoData(): Promise<void> {
   });
   for (let offset = -5; offset <= 0; offset++) {
     // Pay whatever the entry for that month is (escalation changes the amount).
-    const charge = await db('rent_charges')
-      .where({ agreement_id: arjun.id, kind: 'rent' })
-      .whereBetween('period_start', [addMonths(monthStartToday, offset), addDays(addMonths(monthStartToday, offset + 1), -1)])
-      .first('id', 'total_amount');
-    if (charge) await pay(arjun.tenant.id, Number(charge.total_amount), onDay(offset, 2), 'bank_transfer', `IMPS-${offset + 900}`, charge.id);
+    const charge = await col('rent_charges').findOne({
+      agreement_id: arjun.id,
+      kind: 'rent',
+      period_start: { $gte: addMonths(monthStartToday, offset), $lte: addDays(addMonths(monthStartToday, offset + 1), -1) },
+    });
+    if (charge) await pay(arjun.tenant.id, Number(charge.total_amount), onDay(offset, 2), 'bank_transfer', `IMPS-${offset + 900}`, charge._id);
   }
 
   // Shop No 37 — Ayushi Sharma (uses the tenant app): this month is overdue.
@@ -315,20 +337,18 @@ export async function seedDemoData(): Promise<void> {
     gst: true,
     deposit: 48000,
   });
-  await db('deposit_transactions')
-    .whereIn('agreement_id', db('agreements').select('id').where({ unit_id: godownB3.id }))
-    .update({ txn_date: minDate(today, addMonths(monthStartToday, 1))! });
+  await col('deposit_transactions').updateMany(
+    { agreement_id: { $in: await col('agreements').distinct('_id', { unit_id: godownB3.id }) } },
+    { $set: { txn_date: minDate(today, addMonths(monthStartToday, 1))! } },
+  );
 
   // Neha reports this month's payment from the tenant app -> "To confirm".
-  const nehaEntry = await db('rent_charges')
-    .where({ agreement_id: neha.id, kind: 'rent' })
-    .where('period_start', '>=', monthStartToday)
-    .first('id');
-  const nehaUser = await db('users').where({ phone: '+919812345674' }).first('id');
+  const nehaEntry = await col('rent_charges').findOne({ agreement_id: neha.id, kind: 'rent', period_start: { $gte: monthStartToday } });
+  const nehaUser = await col('users').findOne({ phone: '+919812345674' });
   if (nehaEntry && nehaUser) {
     await submitPayment(
-      { userId: nehaUser.id, phone: '+919812345674', tenantIds: [neha.tenant.id] },
-      { chargeId: nehaEntry.id, amount: 33040, paidOn: today, method: 'upi', reference: 'UPI428631907215', notes: 'Paid via PhonePe' },
+      { userId: nehaUser._id, phone: '+919812345674', tenantIds: [neha.tenant.id] },
+      { chargeId: nehaEntry._id, amount: 33040, paidOn: today, method: 'upi', reference: 'UPI428631907215', notes: 'Paid via PhonePe' },
     );
   }
 
@@ -364,19 +384,40 @@ export async function seedDemoData(): Promise<void> {
   }
 
   // Make the activity feed chronological for the demo (payments/expenses at their real dates).
-  await db.raw(
-    `UPDATE activity_logs l SET created_at = ((p.paid_on + time '10:30') AT TIME ZONE ?)
-       FROM payments p
-      WHERE l.entity_id = p.id AND l.action IN ('payment.recorded', 'payment.submitted') AND p.paid_on < ?::date`,
-    [timezone, today],
-  );
-  await db.raw(
-    `UPDATE activity_logs l SET created_at = ((e.expense_date + time '18:00') AT TIME ZONE ?)
-       FROM expenses e
-      WHERE l.entity_id = e.id AND l.action = 'expense.created' AND e.expense_date < ?::date`,
-    [timezone, today],
-  );
+  const retime = async (name: 'payments' | 'expenses', dateField: string, time: string, actions: string[]) => {
+    const docs = await col(name).find({ account_id: account.id, [dateField]: { $lt: today } }, { projection: { [dateField]: 1 } }).toArray();
+    if (docs.length === 0) return;
+    await col('activity_logs').bulkWrite(
+      docs.map((d) => ({
+        updateMany: {
+          filter: { entity_id: d._id, action: { $in: actions } },
+          update: { $set: { created_at: localTimeToUtc(d[dateField], time, timezone) } },
+        },
+      })),
+    );
+  };
+  await retime('payments', 'paid_on', '10:30', ['payment.recorded', 'payment.submitted']);
+  await retime('expenses', 'expense_date', '18:00', ['expense.created']);
 
   const reminders = await runReminderTasks();
   logger.info({ reminders }, 'Demo data created');
+}
+
+/** The instant at which the wall-clock `date time` happens in `timeZone`. */
+function localTimeToUtc(date: string, time: string, timeZone: string): Date {
+  const [y, m, d] = date.split('-').map(Number);
+  const [h, min] = time.split(':').map(Number);
+  const guess = Date.UTC(y, m - 1, d, h, min);
+  const formatted = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).formatToParts(new Date(guess));
+  const part = (type: string) => Number(formatted.find((p) => p.type === type)?.value);
+  const asLocal = Date.UTC(part('year'), part('month') - 1, part('day'), part('hour'), part('minute'));
+  return new Date(guess - (asLocal - guess));
 }

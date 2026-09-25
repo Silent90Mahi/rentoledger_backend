@@ -1,10 +1,11 @@
-import { db } from '../../db/knex.js';
+import { isDuplicateKey, keys } from '../../db/indexes.js';
+import { $round2, col, newId, withTransaction } from '../../db/mongo.js';
 import type { Ctx } from '../../lib/context.js';
-import { Errors, isPgError, PG_ERRORS } from '../../lib/errors.js';
-import { likePattern, resolveSort } from '../../lib/validation.js';
+import { Errors } from '../../lib/errors.js';
+import { round2 } from '../../lib/money.js';
+import { compareRows, resolveSort } from '../../lib/validation.js';
 import { logActivity } from '../activity/activity.service.js';
-import { allocationTotals } from '../finance/finance.queries.js';
-import { chargeQuery, mapCharge, type RentEntryDto } from '../rents/charge-query.js';
+import { chargeStatusStages, findCharges, mapCharge, type RentEntryDto } from '../rents/charge-query.js';
 import { mapUnit, unitsWithOccupancy, type Occupancy, type UnitDto } from './occupancy.js';
 
 export const UNIT_TYPES = ['shop', 'office', 'flat', 'house', 'room', 'warehouse', 'floor', 'land', 'other'] as const;
@@ -35,53 +36,37 @@ export async function listUnits(
 ): Promise<{ items: UnitDto[]; total: number; counts: Record<Occupancy | 'all', number> }> {
   const sort = resolveSort(
     opts.sort,
-    { name: 'lower(x.name)', rent: 'x.ca_rent_amount', createdAt: 'x.created_at', property: 'lower(x.property_name)', dueDay: 'x.ca_due_day' },
-    { column: 'lower(x.name)', direction: 'asc' },
+    { name: 'name', rent: 'ca_rent_amount', createdAt: 'created_at', property: 'property_name', dueDay: 'ca_due_day' },
+    { column: 'name', direction: 'asc' },
   );
 
-  const inner = unitsWithOccupancy(db, ctx.accountId, ctx.today).modify((q) => {
-    if (opts.archived) q.whereNotNull('u.archived_at');
-    else q.whereNull('u.archived_at');
-    if (opts.propertyId) q.where('u.property_id', opts.propertyId);
-    if (opts.type) q.where('u.type', opts.type);
-    if (opts.search) {
-      const pattern = likePattern(opts.search);
-      q.where((w) =>
-        w
-          .whereILike('u.name', pattern)
-          .orWhereILike('p.name', pattern)
-          .orWhereILike('ct.name', pattern)
-          .orWhereILike('ct.phone', pattern)
-          .orWhereILike('ct.business_name', pattern),
-      );
-    }
+  let rows = await unitsWithOccupancy(ctx.accountId, ctx.today, {
+    archived_at: opts.archived ? { $ne: null } : null,
+    ...(opts.propertyId ? { property_id: opts.propertyId } : {}),
+    ...(opts.type ? { type: opts.type } : {}),
   });
-
-  const countsRows = await db
-    .from(inner.clone().as('x'))
-    .select('x.occupancy')
-    .count({ count: '*' })
-    .groupBy('x.occupancy');
-  const counts: Record<Occupancy | 'all', number> = { all: 0, occupied: 0, vacant: 0, reserved: 0 };
-  for (const r of countsRows as any[]) {
-    counts[r.occupancy as Occupancy] = Number(r.count);
-    counts.all += Number(r.count);
+  if (opts.search) {
+    const needle = opts.search.toLowerCase();
+    rows = rows.filter((r) =>
+      [r.name, r.property_name, r.ct_name, r.ct_phone, r.ct_business_name].some((v) => typeof v === 'string' && v.toLowerCase().includes(needle)),
+    );
   }
 
-  const filtered = db.from(inner.as('x')).modify((q) => {
-    if (opts.occupancy) q.where('x.occupancy', opts.occupancy);
-  });
-  const total = opts.occupancy ? counts[opts.occupancy] : counts.all;
-  const rows = await filtered
-    .select('x.*')
-    .orderByRaw(`${sort.column} ${sort.direction} NULLS LAST, x.id`)
-    .limit(opts.pageSize)
-    .offset((opts.page - 1) * opts.pageSize);
-  return { items: rows.map((r: Record<string, any>) => mapUnit(r, ctx.today)), total, counts };
+  const counts: Record<Occupancy | 'all', number> = { all: 0, occupied: 0, vacant: 0, reserved: 0 };
+  for (const r of rows) {
+    counts[r.occupancy as Occupancy] += 1;
+    counts.all += 1;
+  }
+
+  const filtered = opts.occupancy ? rows.filter((r) => r.occupancy === opts.occupancy) : rows;
+  const total = filtered.length;
+  filtered.sort((a, b) => compareRows(a, b, sort.column, sort.direction));
+  const page = filtered.slice((opts.page - 1) * opts.pageSize, opts.page * opts.pageSize);
+  return { items: page.map((r) => mapUnit(r, ctx.today)), total, counts };
 }
 
 async function findUnitRow(ctx: Ctx, id: string) {
-  const row = await db('units').where({ id, account_id: ctx.accountId }).first();
+  const row = await col('units').findOne({ _id: id, account_id: ctx.accountId });
   if (!row) throw Errors.notFound('Unit');
   return row;
 }
@@ -105,31 +90,39 @@ export interface UnitDetailDto extends UnitDto {
 }
 
 export async function getUnit(ctx: Ctx, id: string): Promise<UnitDetailDto> {
-  const row = await unitsWithOccupancy(db, ctx.accountId, ctx.today).where('u.id', id).first();
+  const [row] = await unitsWithOccupancy(ctx.accountId, ctx.today, { _id: id });
   if (!row) throw Errors.notFound('Unit');
 
-  const agreements = await db('agreements as a')
-    .join('tenants as t', 't.id', 'a.tenant_id')
-    .where({ 'a.unit_id': id, 'a.account_id': ctx.accountId })
-    .orderBy('a.start_date', 'desc')
-    .select('a.*', 't.name as tenant_name', 't.phone as tenant_phone');
+  const agreementDocs = await col('agreements').find({ unit_id: id, account_id: ctx.accountId }).sort({ start_date: -1 }).toArray();
+  const tenants = new Map(
+    (await col('tenants').find({ _id: { $in: agreementDocs.map((a) => a.tenant_id) } }).toArray()).map((t) => [t._id, t]),
+  );
+  const agreements = agreementDocs.map((a) => ({
+    ...a,
+    id: a._id,
+    tenant_name: tenants.get(a.tenant_id)?.name,
+    tenant_phone: tenants.get(a.tenant_id)?.phone,
+  }));
 
-  const entries = await db
-    .from(chargeQuery(db, { accountId: ctx.accountId }, ctx.today).where('c.unit_id', id).as('lc'))
-    .whereNot('lc.status', 'void')
-    .orderBy([
-      { column: 'lc.period_start', order: 'desc' },
-      { column: 'lc.created_at', order: 'desc' },
+  const entries = await findCharges({ accountId: ctx.accountId }, ctx.today, { unit_id: id, voided_at: null }, {
+    sort: { period_start: -1, created_at: -1 },
+    limit: 6,
+  });
+
+  const [fin] = await col('rent_charges')
+    .aggregate([
+      ...chargeStatusStages({ accountId: ctx.accountId }, ctx.today, { unit_id: id, voided_at: null }),
+      {
+        $group: {
+          _id: null,
+          outstanding: { $sum: '$balance' },
+          overdue: { $sum: { $cond: [{ $lt: ['$due_date', ctx.today] }, '$balance', 0] } },
+          collected: { $sum: '$paid_amount' },
+        },
+      },
+      { $project: { outstanding: $round2('$outstanding'), overdue: $round2('$overdue'), collected: $round2('$collected') } },
     ])
-    .limit(6);
-
-  const [fin] = await db('rent_charges as c')
-    .leftJoin(allocationTotals(db, ctx.accountId).as('al'), 'al.charge_id', 'c.id')
-    .where({ 'c.unit_id': id, 'c.account_id': ctx.accountId })
-    .whereNull('c.voided_at')
-    .select(db.raw('COALESCE(SUM(c.total_amount - COALESCE(al.paid, 0)), 0) AS outstanding'))
-    .select(db.raw('COALESCE(SUM(CASE WHEN c.due_date < ?::date THEN c.total_amount - COALESCE(al.paid, 0) ELSE 0 END), 0) AS overdue', [ctx.today]))
-    .select(db.raw('COALESCE(SUM(COALESCE(al.paid, 0)), 0) AS collected'));
+    .toArray();
 
   return {
     ...mapUnit(row, ctx.today),
@@ -138,22 +131,22 @@ export async function getUnit(ctx: Ctx, id: string): Promise<UnitDetailDto> {
       status: a.status,
       tenant: { id: a.tenant_id, name: a.tenant_name, phone: a.tenant_phone },
       startDate: a.start_date,
-      endDate: a.end_date,
-      endedOn: a.ended_on,
+      endDate: a.end_date ?? null,
+      endedOn: a.ended_on ?? null,
       rentAmount: Number(a.rent_amount),
       billingCycle: a.billing_cycle,
       dueDay: a.due_day,
     })),
     recentEntries: entries.map((e) => mapCharge(e, ctx.today)),
     financials: {
-      outstanding: Number(fin?.outstanding ?? 0),
-      overdue: Number(fin?.overdue ?? 0),
-      collectedTotal: Number(fin?.collected ?? 0),
+      outstanding: round2(fin?.outstanding ?? 0),
+      overdue: round2(fin?.overdue ?? 0),
+      collectedTotal: round2(fin?.collected ?? 0),
     },
   };
 }
 
-function toRow(input: Partial<UnitInput>) {
+function toFields(input: Partial<UnitInput>) {
   const row: Record<string, unknown> = {};
   if (input.propertyId !== undefined) row.property_id = input.propertyId;
   if (input.name !== undefined) row.name = input.name;
@@ -166,14 +159,14 @@ function toRow(input: Partial<UnitInput>) {
 }
 
 function translateUnitError(error: unknown): never {
-  if (isPgError(error) && error.code === PG_ERRORS.UNIQUE_VIOLATION) {
+  if (isDuplicateKey(error)) {
     throw Errors.conflict('A unit with this name already exists in this property.', [{ field: 'name', message: 'Already exists' }]);
   }
   throw error;
 }
 
 async function assertPropertyUsable(ctx: Ctx, propertyId: string) {
-  const property = await db('properties').where({ id: propertyId, account_id: ctx.accountId }).first();
+  const property = await col('properties').findOne({ _id: propertyId, account_id: ctx.accountId });
   if (!property) throw Errors.validation('Property not found.', [{ field: 'propertyId', message: 'Property not found' }]);
   if (property.archived_at) throw Errors.conflict('This property is archived. Restore it before adding units.');
   return property;
@@ -183,15 +176,32 @@ export async function createUnit(ctx: Ctx, input: UnitInput): Promise<UnitDetail
   const property = await assertPropertyUsable(ctx, input.propertyId);
   let id: string;
   try {
-    id = await db.transaction(async (trx) => {
-      const [row] = await trx('units').insert({ ...toRow(input), account_id: ctx.accountId }).returning(['id']);
-      await logActivity(trx, ctx, {
+    id = await withTransaction(async (session) => {
+      const now = new Date();
+      const unitId = newId();
+      await col('units').insertOne(
+        {
+          _id: unitId,
+          account_id: ctx.accountId,
+          floor: null,
+          area_sqft: null,
+          default_rent: null,
+          notes: null,
+          ...toFields(input),
+          name_key: keys.name(input.name),
+          archived_at: null,
+          created_at: now,
+          updated_at: now,
+        },
+        { session },
+      );
+      await logActivity(session, ctx, {
         action: 'unit.created',
         entityType: 'unit',
-        entityId: row.id,
+        entityId: unitId,
         summary: `Added unit ${input.name} in ${property.name}`,
       });
-      return row.id as string;
+      return unitId;
     });
   } catch (error) {
     translateUnitError(error);
@@ -204,12 +214,13 @@ export async function updateUnit(ctx: Ctx, id: string, input: Partial<UnitInput>
   if (input.propertyId && input.propertyId !== unit.property_id) {
     await assertPropertyUsable(ctx, input.propertyId);
   }
-  const changes = toRow(input);
+  const changes = toFields(input);
+  if (input.name !== undefined && !unit.archived_at) changes.name_key = keys.name(input.name);
   if (Object.keys(changes).length) {
     try {
-      await db.transaction(async (trx) => {
-        await trx('units').where({ id, account_id: ctx.accountId }).update(changes);
-        await logActivity(trx, ctx, { action: 'unit.updated', entityType: 'unit', entityId: id, summary: `Updated unit ${input.name ?? unit.name}` });
+      await withTransaction(async (session) => {
+        await col('units').updateOne({ _id: id, account_id: ctx.accountId }, { $set: { ...changes, updated_at: new Date() } }, { session });
+        await logActivity(session, ctx, { action: 'unit.updated', entityType: 'unit', entityId: id, summary: `Updated unit ${input.name ?? unit.name}` });
       });
     } catch (error) {
       translateUnitError(error);
@@ -220,23 +231,24 @@ export async function updateUnit(ctx: Ctx, id: string, input: Partial<UnitInput>
 
 export async function archiveUnit(ctx: Ctx, id: string): Promise<UnitDetailDto> {
   const unit = await findUnitRow(ctx, id);
-  const active = await db('agreements').where({ unit_id: id, status: 'active' }).first('id');
+  const active = await col('agreements').findOne({ unit_id: id, status: 'active' });
   if (active) throw Errors.conflict('End the active agreement of this unit before archiving it.');
-  await db.transaction(async (trx) => {
-    await trx('units').where({ id }).update({ archived_at: new Date() });
-    await logActivity(trx, ctx, { action: 'unit.archived', entityType: 'unit', entityId: id, summary: `Archived unit ${unit.name}` });
+  await withTransaction(async (session) => {
+    const at = new Date();
+    await col('units').updateOne({ _id: id }, { $set: { archived_at: at, updated_at: at }, $unset: { name_key: '' } }, { session });
+    await logActivity(session, ctx, { action: 'unit.archived', entityType: 'unit', entityId: id, summary: `Archived unit ${unit.name}` });
   });
   return getUnit(ctx, id);
 }
 
 export async function restoreUnit(ctx: Ctx, id: string): Promise<UnitDetailDto> {
   const unit = await findUnitRow(ctx, id);
-  const property = await db('properties').where({ id: unit.property_id }).first();
+  const property = await col('properties').findOne({ _id: unit.property_id });
   if (property?.archived_at) throw Errors.conflict('Restore the property first.');
   try {
-    await db.transaction(async (trx) => {
-      await trx('units').where({ id }).update({ archived_at: null });
-      await logActivity(trx, ctx, { action: 'unit.restored', entityType: 'unit', entityId: id, summary: `Restored unit ${unit.name}` });
+    await withTransaction(async (session) => {
+      await col('units').updateOne({ _id: id }, { $set: { archived_at: null, name_key: keys.name(unit.name), updated_at: new Date() } }, { session });
+      await logActivity(session, ctx, { action: 'unit.restored', entityType: 'unit', entityId: id, summary: `Restored unit ${unit.name}` });
     });
   } catch (error) {
     translateUnitError(error);
@@ -246,11 +258,11 @@ export async function restoreUnit(ctx: Ctx, id: string): Promise<UnitDetailDto> 
 
 export async function deleteUnit(ctx: Ctx, id: string): Promise<void> {
   const unit = await findUnitRow(ctx, id);
-  const history = await db('agreements').where({ unit_id: id }).first('id');
+  const history = await col('agreements').findOne({ unit_id: id });
   if (history) throw Errors.conflict('This unit has rental history. Archive it instead of deleting.');
-  await db.transaction(async (trx) => {
-    await trx('expenses').where({ unit_id: id }).update({ unit_id: null });
-    await trx('units').where({ id, account_id: ctx.accountId }).delete();
-    await logActivity(trx, ctx, { action: 'unit.deleted', entityType: 'unit', entityId: id, summary: `Deleted unit ${unit.name}` });
+  await withTransaction(async (session) => {
+    await col('expenses').updateMany({ account_id: ctx.accountId, unit_id: id }, { $set: { unit_id: null } }, { session });
+    await col('units').deleteOne({ _id: id, account_id: ctx.accountId }, { session });
+    await logActivity(session, ctx, { action: 'unit.deleted', entityType: 'unit', entityId: id, summary: `Deleted unit ${unit.name}` });
   });
 }

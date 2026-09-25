@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { getDb } from '../src/db/knex.js';
+import { col } from '../src/db/mongo.js';
 import { api, auth, createOwner, freezeToday, login, resetDatabase, V1 } from './helpers.js';
 
 describe('authentication', () => {
@@ -17,7 +17,7 @@ describe('authentication', () => {
   it('sends an OTP and exposes it only in development', async () => {
     const res = await api().post(`${V1}/auth/otp/request`).send({ phone: '98765 00001' }).expect(200);
     expect(res.body.data).toMatchObject({ phone: '+919876500001', expiresInSeconds: 300, devCode: '123456' });
-    const stored = await getDb()('otp_codes').where({ phone: '+919876500001' }).first();
+    const stored = await col('otp_codes').findOne({ phone: '+919876500001' });
     expect(stored.code_hash).not.toContain('123456');
   });
 

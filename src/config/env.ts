@@ -31,11 +31,9 @@ const EnvSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(4000),
   API_PREFIX: z.string().default('/api/v1'),
 
-  DATABASE_URL: z.string().optional(),
-  DATABASE_SSL: booleanFlag(false),
-  DATABASE_SSL_REJECT_UNAUTHORIZED: booleanFlag(true),
-  DATABASE_POOL_MAX: z.coerce.number().int().min(2).max(200).default(10),
-  DB_AUTO_MIGRATE: booleanFlag(false),
+  MONGODB_URI: z.string().optional(),
+  MONGODB_DB: z.string().trim().min(1).max(63).default('rentoledger'),
+  MONGODB_POOL_MAX: z.coerce.number().int().min(2).max(500).default(20),
 
   JWT_ACCESS_SECRET: z.string().optional(),
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).default(900),
@@ -101,7 +99,7 @@ function fail(message: string): never {
 }
 
 if (isProduction) {
-  if (!env.DATABASE_URL) fail('DATABASE_URL is required in production.');
+  if (!env.MONGODB_URI) fail('MONGODB_URI is required in production.');
   if (!env.JWT_ACCESS_SECRET || env.JWT_ACCESS_SECRET.length < 32) {
     fail('JWT_ACCESS_SECRET must be set to a random string of at least 32 characters in production.');
   }
@@ -146,11 +144,9 @@ export const config = {
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
   },
   db: {
-    url: env.DATABASE_URL,
-    ssl: env.DATABASE_SSL,
-    sslRejectUnauthorized: env.DATABASE_SSL_REJECT_UNAUTHORIZED,
-    poolMax: env.DATABASE_POOL_MAX,
-    autoMigrate: env.DB_AUTO_MIGRATE,
+    uri: env.MONGODB_URI,
+    name: env.MONGODB_DB,
+    poolMax: env.MONGODB_POOL_MAX,
   },
   auth: {
     accessSecret: env.JWT_ACCESS_SECRET ?? DEV_ACCESS_SECRET,

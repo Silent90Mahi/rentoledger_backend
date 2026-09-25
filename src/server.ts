@@ -2,14 +2,15 @@ import type { Server } from 'node:http';
 import { createApp } from './app.js';
 import { config } from './config/env.js';
 import { logger } from './config/logger.js';
-import { closeDb, getDb } from './db/knex.js';
-import { migrateLatest } from './db/migrate.js';
+import { ensureIndexes } from './db/indexes.js';
+import { closeDb, connectDb, getDb } from './db/mongo.js';
 import { startScheduler } from './jobs/scheduler.js';
 
 async function waitForDatabase(attempts = 10): Promise<void> {
   for (let i = 1; i <= attempts; i++) {
     try {
-      await getDb().raw('SELECT 1');
+      await connectDb();
+      await getDb().command({ ping: 1 });
       return;
     } catch (error) {
       if (i === attempts) throw error;
@@ -24,10 +25,8 @@ async function main(): Promise<void> {
     logger.warn('Using built-in development secrets. Set JWT_ACCESS_SECRET and OTP_SECRET before deploying.');
   }
   await waitForDatabase();
-  if (config.db.autoMigrate) {
-    const applied = await migrateLatest(getDb());
-    if (applied.length) logger.info({ applied }, 'Applied database migrations');
-  }
+  // Idempotent: creates any missing collection index (the MongoDB equivalent of migrations).
+  await ensureIndexes();
 
   const app = createApp();
   const server: Server = app.listen(config.server.port, config.server.host, () => {

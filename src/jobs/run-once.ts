@@ -3,7 +3,7 @@
  * (cron, Kubernetes CronJob, Cloud Scheduler) when JOBS_ENABLED=false.
  */
 import { logger } from '../config/logger.js';
-import { closeDb } from '../db/knex.js';
+import { closeDb } from '../db/mongo.js';
 import { runScheduledJobs } from './scheduler.js';
 
 try {

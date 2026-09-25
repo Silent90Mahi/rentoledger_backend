@@ -3,9 +3,9 @@
  *
  *   tsx scripts/with-dev-db.ts src/db/cli.ts reset
  *
- * Uses DATABASE_URL when it is set. Otherwise it reuses the embedded
- * PostgreSQL that `npm run dev` runs (or starts it for the duration of the
- * command), so `npm run db:reset` and friends work without any setup.
+ * Uses MONGODB_URI when it is set. Otherwise it reuses the local MongoDB that
+ * `npm run dev` runs (or starts it for the duration of the command), so
+ * `npm run db:reset` and friends work without any setup.
  */
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -21,23 +21,22 @@ if (!entry) {
   process.exit(1);
 }
 
-// Loads .env so DATABASE_URL / NODE_ENV from the file are honoured.
+// Loads .env so MONGODB_URI / NODE_ENV from the file are honoured.
 const { config } = await import('../src/config/env.js');
 
 let stopDatabase: (() => Promise<void>) | null = null;
-if (!process.env.DATABASE_URL && !config.db.url) {
+if (!process.env.MONGODB_URI && !config.db.uri) {
   if (config.isProduction) {
-    console.error('DATABASE_URL must be set in production.');
+    console.error('MONGODB_URI must be set in production.');
     process.exit(1);
   }
-  const { startEmbeddedPostgres } = await import('./embedded-postgres.js');
-  const embedded = await startEmbeddedPostgres({
-    dataDir: path.join(root, '.data', 'postgres'),
-    port: Number(process.env.EMBEDDED_PG_PORT ?? 54329),
-    database: 'rentoledger',
+  const { startEmbeddedMongo } = await import('./embedded-mongo.js');
+  const embedded = await startEmbeddedMongo({
+    dataDir: path.join(root, '.data', 'mongo'),
+    port: Number(process.env.EMBEDDED_MONGO_PORT ?? 27027),
     log: (message) => console.log(message),
   });
-  process.env.DATABASE_URL = embedded.url;
+  process.env.MONGODB_URI = embedded.uri;
   if (embedded.owned) stopDatabase = embedded.stop;
 }
 

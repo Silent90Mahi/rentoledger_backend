@@ -1,4 +1,4 @@
-import { db, type DbOrTrx } from '../../db/knex.js';
+import { col, newId, opts, type Session } from '../../db/mongo.js';
 
 export interface ActivityEntry {
   action: string;
@@ -8,21 +8,26 @@ export interface ActivityEntry {
   metadata?: Record<string, unknown>;
 }
 
-/** Appends an audit/activity record. Call inside the same transaction as the change. */
+/** Appends an audit/activity record. Pass the transaction session of the change. */
 export async function logActivity(
-  q: DbOrTrx,
+  session: Session,
   who: { accountId: string; userId?: string | null },
   entry: ActivityEntry,
 ): Promise<void> {
-  await q('activity_logs').insert({
-    account_id: who.accountId,
-    user_id: who.userId ?? null,
-    action: entry.action,
-    entity_type: entry.entityType ?? null,
-    entity_id: entry.entityId ?? null,
-    summary: entry.summary,
-    metadata: entry.metadata ? JSON.stringify(entry.metadata) : null,
-  });
+  await col('activity_logs').insertOne(
+    {
+      _id: newId(),
+      account_id: who.accountId,
+      user_id: who.userId ?? null,
+      action: entry.action,
+      entity_type: entry.entityType ?? null,
+      entity_id: entry.entityId ?? null,
+      summary: entry.summary,
+      metadata: entry.metadata ?? null,
+      created_at: new Date(),
+    },
+    opts(session),
+  );
 }
 
 export interface ActivityItem {
@@ -37,33 +42,36 @@ export interface ActivityItem {
 
 export async function listActivity(
   accountId: string,
-  opts: { page: number; pageSize: number; entityType?: string; entityId?: string },
+  query: { page: number; pageSize: number; entityType?: string; entityId?: string },
 ): Promise<{ items: ActivityItem[]; total: number }> {
-  const base = db('activity_logs as l')
-    .leftJoin('users as u', 'u.id', 'l.user_id')
-    .where('l.account_id', accountId)
-    .modify((q) => {
-      if (opts.entityType) q.where('l.entity_type', opts.entityType);
-      if (opts.entityId) q.where('l.entity_id', opts.entityId);
-    });
+  const filter: Record<string, unknown> = { account_id: accountId };
+  if (query.entityType) filter.entity_type = query.entityType;
+  if (query.entityId) filter.entity_id = query.entityId;
 
-  const [{ count }] = await base.clone().count<{ count: number }[]>({ count: '*' });
-  const rows = await base
-    .clone()
-    .select('l.id', 'l.action', 'l.entity_type', 'l.entity_id', 'l.summary', 'l.created_at', 'u.name as actor_name')
-    .orderBy('l.created_at', 'desc')
-    .limit(opts.pageSize)
-    .offset((opts.page - 1) * opts.pageSize);
+  const [total, rows] = await Promise.all([
+    col('activity_logs').countDocuments(filter),
+    col('activity_logs')
+      .aggregate([
+        { $match: filter },
+        { $sort: { created_at: -1, _id: -1 } },
+        { $skip: (query.page - 1) * query.pageSize },
+        { $limit: query.pageSize },
+        { $lookup: { from: 'users', localField: 'user_id', foreignField: '_id', as: 'u' } },
+        { $addFields: { actor_name: { $first: '$u.name' } } },
+        { $project: { u: 0 } },
+      ])
+      .toArray(),
+  ]);
 
   return {
-    total: Number(count),
-    items: rows.map((r: Record<string, any>) => ({
-      id: r.id,
+    total,
+    items: rows.map((r) => ({
+      id: r._id,
       action: r.action,
-      entityType: r.entity_type,
-      entityId: r.entity_id,
+      entityType: r.entity_type ?? null,
+      entityId: r.entity_id ?? null,
       summary: r.summary,
-      actorName: r.actor_name,
+      actorName: r.actor_name ?? null,
       createdAt: r.created_at,
     })),
   };

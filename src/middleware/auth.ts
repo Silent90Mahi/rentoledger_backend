@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
-import { db } from '../db/knex.js';
+import { col } from '../db/mongo.js';
 import { Errors } from '../lib/errors.js';
 import { verifyAccessToken } from '../modules/auth/token.service.js';
 
@@ -16,35 +16,24 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
   const token = bearerToken(req);
   if (!token) throw Errors.unauthorized();
   const { userId } = verifyAccessToken(token);
-  const user = await db('users').select('id', 'phone', 'name').where({ id: userId }).first();
+  const user = await col('users').findOne({ _id: userId }, { projection: { phone: 1, name: 1 } });
   if (!user) throw Errors.unauthorized('Your account no longer exists. Please sign in again.');
-  req.user = { id: user.id, phone: user.phone, name: user.name };
+  req.user = { id: user._id, phone: user.phone, name: user.name ?? null };
   next();
 }
 
 /** Requires the user to be an owner or partner of an account (landlord side). */
 export async function requireAccount(req: Request, _res: Response, next: NextFunction): Promise<void> {
   if (!req.user) throw Errors.unauthorized();
-  const row = await db('account_members as m')
-    .join('accounts as a', 'a.id', 'm.account_id')
-    .select(
-      'a.id',
-      'a.name',
-      'a.timezone',
-      'a.gst_enabled',
-      'a.gst_rate',
-      'a.reminder_days_before',
-      'm.role',
-    )
-    .where('m.user_id', req.user.id)
-    .first();
+  const member = await col('account_members').findOne({ user_id: req.user.id });
+  const row = member ? await col('accounts').findOne({ _id: member.account_id }) : null;
   if (!row) {
     throw Errors.forbidden('Set up your landlord account to access this feature.');
   }
   req.account = {
-    id: row.id,
+    id: row._id,
     name: row.name,
-    role: row.role,
+    role: member!.role,
     timezone: row.timezone,
     gstEnabled: row.gst_enabled,
     gstRate: row.gst_rate,
@@ -64,10 +53,11 @@ export function requireOwner(req: Request, _res: Response, next: NextFunction): 
 /** Tenant portal: the signed-in phone number must belong to at least one tenant record. */
 export async function requireTenant(req: Request, _res: Response, next: NextFunction): Promise<void> {
   if (!req.user) throw Errors.unauthorized();
-  const ids = await db('tenants')
-    .where({ phone: req.user.phone, portal_enabled: true })
-    .whereNull('archived_at')
-    .pluck('id');
+  const ids = (
+    await col('tenants')
+      .find({ phone: req.user.phone, portal_enabled: true, archived_at: null }, { projection: { _id: 1 } })
+      .toArray()
+  ).map((t) => t._id);
   if (ids.length === 0) {
     throw Errors.forbidden('No rental records are linked to your mobile number yet. Ask your landlord to add you.');
   }

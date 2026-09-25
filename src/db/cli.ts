@@ -1,42 +1,33 @@
 /**
  * Database CLI:
- *   migrate   apply pending migrations (creates the database if missing)
- *   rollback  undo the last migration batch
+ *   migrate   create collections and indexes (idempotent; also runs on server start)
  *   seed      load demo data into an empty database (--force allows it in production; never wipes data)
- *   reset     drop everything, migrate and seed (development only)
+ *   reset     drop the database, recreate indexes and load demo data (development only)
  */
 import { config } from '../config/env.js';
 import { logger } from '../config/logger.js';
-import { ensureDatabaseExists } from './ensure-database.js';
-import { closeDb, getDb } from './knex.js';
-import { migrateLatest, rollbackAll, rollbackLast } from './migrate.js';
+import { ensureIndexes } from './indexes.js';
+import { closeDb, col, connectDb, getDb } from './mongo.js';
 import { seedDemoData } from './seed/demo.js';
 
 async function isEmpty(): Promise<boolean> {
-  const [{ count }] = await getDb()('users').count<{ count: number }[]>({ count: '*' });
-  return Number(count) === 0;
+  return (await col('users').countDocuments({}, { limit: 1 })) === 0;
 }
 
 async function run(command: string, force: boolean): Promise<void> {
-  const url = process.env.DATABASE_URL ?? config.db.url;
-  if (!url) {
-    throw new Error('DATABASE_URL is not set. Tip: `npm run dev` starts a local database automatically.');
+  if (!process.env.MONGODB_URI && !config.db.uri) {
+    throw new Error('MONGODB_URI is not set. Tip: `npm run dev` starts a local database automatically.');
   }
+  await connectDb();
   switch (command) {
     case 'migrate': {
-      if (!config.isProduction) await ensureDatabaseExists(url, config.db.ssl);
-      const applied = await migrateLatest(getDb());
-      logger.info(applied.length ? `Applied migrations: ${applied.join(', ')}` : 'Database is up to date');
-      return;
-    }
-    case 'rollback': {
-      const rolledBack = await rollbackLast(getDb());
-      logger.info(rolledBack.length ? `Rolled back: ${rolledBack.join(', ')}` : 'Nothing to roll back');
+      const count = await ensureIndexes();
+      logger.info(`Database ready (${count} indexes checked)`);
       return;
     }
     case 'seed': {
       if (config.isProduction && !force) throw new Error('Refusing to seed demo data in production (pass --force to override).');
-      await migrateLatest(getDb());
+      await ensureIndexes();
       if (!(await isEmpty())) {
         logger.warn('Database already has data; skipping demo seed. In development, `npm run db:reset` starts over.');
         return;
@@ -46,15 +37,14 @@ async function run(command: string, force: boolean): Promise<void> {
     }
     case 'reset': {
       if (config.isProduction) throw new Error('db:reset is disabled in production.');
-      await ensureDatabaseExists(url, config.db.ssl);
-      await rollbackAll(getDb());
-      await migrateLatest(getDb());
+      await getDb().dropDatabase();
+      await ensureIndexes();
       await seedDemoData();
       logger.info('Database reset with demo data');
       return;
     }
     default:
-      throw new Error(`Unknown command "${command}". Use migrate | rollback | seed | reset.`);
+      throw new Error(`Unknown command "${command}". Use migrate | seed | reset.`);
   }
 }
 

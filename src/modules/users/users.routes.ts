@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { db } from '../../db/knex.js';
+import { col } from '../../db/mongo.js';
 import { ok } from '../../lib/http.js';
 import { parse, zEmail, zName } from '../../lib/validation.js';
 import { buildSession } from '../auth/auth.service.js';
@@ -24,7 +24,7 @@ usersRouter.patch('/me', async (req, res) => {
   if (input.name !== undefined) changes.name = input.name;
   if (input.email !== undefined) changes.email = input.email;
   if (input.lateRentNotifications !== undefined) changes.late_rent_notifications = input.lateRentNotifications;
-  if (Object.keys(changes).length) await db('users').where({ id: req.user!.id }).update(changes);
+  if (Object.keys(changes).length) await col('users').updateOne({ _id: req.user!.id }, { $set: { ...changes, updated_at: new Date() } });
   ok(res, await buildSession(req.user!.id));
 });
 

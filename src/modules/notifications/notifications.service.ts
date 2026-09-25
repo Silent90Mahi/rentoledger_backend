@@ -1,4 +1,4 @@
-import { db, type DbOrTrx } from '../../db/knex.js';
+import { col, newId, opts, type Session } from '../../db/mongo.js';
 import { now } from '../../lib/clock.js';
 import { Errors } from '../../lib/errors.js';
 
@@ -28,33 +28,44 @@ export interface NewNotification {
 }
 
 async function insertMany(
-  q: DbOrTrx,
+  session: Session,
   userIds: string[],
   accountId: string | null,
   audience: Audience,
   n: NewNotification,
 ): Promise<number> {
   if (userIds.length === 0) return 0;
-  const values = userIds.map((userId) => [
-    userId,
-    accountId,
+  const doc = (userId: string) => ({
+    _id: newId(),
+    user_id: userId,
+    account_id: accountId,
     audience,
-    n.type,
-    n.title.slice(0, 200),
-    n.body ?? null,
-    n.entityType ?? null,
-    n.entityId ?? null,
-    n.data ? JSON.stringify(n.data) : null,
-    n.dedupeKey ?? null,
-  ]);
-  const placeholders = values.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?)').join(', ');
-  const result = await q.raw(
-    `INSERT INTO notifications (user_id, account_id, audience, type, title, body, entity_type, entity_id, data, dedupe_key)
-     VALUES ${placeholders}
-     ON CONFLICT DO NOTHING`,
-    values.flat(),
+    type: n.type,
+    title: n.title.slice(0, 200),
+    body: n.body ?? null,
+    entity_type: n.entityType ?? null,
+    entity_id: n.entityId ?? null,
+    data: n.data ?? null,
+    read_at: null,
+    created_at: new Date(),
+  });
+  if (!n.dedupeKey) {
+    const result = await col('notifications').insertMany(userIds.map(doc), opts(session));
+    return result.insertedCount;
+  }
+  // Upsert on (user, dedupe key): never sends the same notification twice and,
+  // unlike a failing insert, does not abort the surrounding transaction.
+  const result = await col('notifications').bulkWrite(
+    userIds.map((userId) => ({
+      updateOne: {
+        filter: { user_id: userId, dedupe_key: n.dedupeKey },
+        update: { $setOnInsert: (({ user_id: _u, ...rest }) => rest)(doc(userId)) },
+        upsert: true,
+      },
+    })),
+    opts(session),
   );
-  return result.rowCount ?? 0;
+  return result.upsertedCount;
 }
 
 /**
@@ -62,20 +73,20 @@ async function insertMany(
  * recipients to members who kept "Late-rent notifications" switched on.
  */
 export async function notifyAccountMembers(
-  q: DbOrTrx,
+  session: Session,
   accountId: string,
   n: NewNotification,
-  opts: { excludeUserId?: string | null; lateRentOnly?: boolean } = {},
+  options: { excludeUserId?: string | null; lateRentOnly?: boolean } = {},
 ): Promise<number> {
-  const members = await q('account_members as m')
-    .join('users as u', 'u.id', 'm.user_id')
-    .where('m.account_id', accountId)
-    .modify((qb) => {
-      if (opts.excludeUserId) qb.whereNot('m.user_id', opts.excludeUserId);
-      if (opts.lateRentOnly) qb.where('u.late_rent_notifications', true);
-    })
-    .pluck('m.user_id');
-  return insertMany(q, members, accountId, 'owner', n);
+  const members = await col('account_members').find({ account_id: accountId }, opts(session)).toArray();
+  let userIds = members.map((m) => m.user_id as string).filter((id) => id !== options.excludeUserId);
+  if (options.lateRentOnly && userIds.length) {
+    const users = await col('users')
+      .find({ _id: { $in: userIds }, late_rent_notifications: true }, { ...opts(session), projection: { _id: 1 } })
+      .toArray();
+    userIds = users.map((u) => u._id);
+  }
+  return insertMany(session, userIds, accountId, 'owner', n);
 }
 
 /**
@@ -84,22 +95,19 @@ export async function notifyAccountMembers(
  * confirmations and rejections are always delivered.
  */
 export async function notifyTenant(
-  q: DbOrTrx,
+  session: Session,
   tenantId: string,
   n: NewNotification,
-  opts: { reminder?: boolean } = {},
+  options: { reminder?: boolean } = {},
 ): Promise<number> {
-  const row = await q('tenants as t')
-    .join('users as u', 'u.phone', 't.phone')
-    .where('t.id', tenantId)
-    .where('t.portal_enabled', true)
-    .whereNull('t.archived_at')
-    .modify((qb) => {
-      if (opts.reminder) qb.where('u.late_rent_notifications', true);
-    })
-    .first('u.id as user_id', 't.account_id');
-  if (!row) return 0;
-  return insertMany(q, [row.user_id], row.account_id, 'tenant', n);
+  const tenant = await col('tenants').findOne({ _id: tenantId, portal_enabled: true, archived_at: null }, opts(session));
+  if (!tenant) return 0;
+  const user = await col('users').findOne(
+    { phone: tenant.phone, ...(options.reminder ? { late_rent_notifications: true } : {}) },
+    opts(session),
+  );
+  if (!user) return 0;
+  return insertMany(session, [user._id], tenant.account_id, 'tenant', n);
 }
 
 export interface NotificationItem {
@@ -116,14 +124,14 @@ export interface NotificationItem {
 
 function mapNotification(r: Record<string, unknown>): NotificationItem {
   return {
-    id: r.id as string,
+    id: r._id as string,
     type: r.type as string,
     title: r.title as string,
     body: (r.body as string) ?? null,
     entityType: (r.entity_type as string) ?? null,
     entityId: (r.entity_id as string) ?? null,
     data: (r.data as Record<string, unknown>) ?? null,
-    read: r.read_at !== null,
+    read: r.read_at !== null && r.read_at !== undefined,
     createdAt: r.created_at as string,
   };
 }
@@ -131,42 +139,38 @@ function mapNotification(r: Record<string, unknown>): NotificationItem {
 export async function listNotifications(
   userId: string,
   audience: Audience,
-  opts: { page: number; pageSize: number; unreadOnly?: boolean },
+  query: { page: number; pageSize: number; unreadOnly?: boolean },
 ): Promise<{ items: NotificationItem[]; total: number; unread: number }> {
-  const base = db('notifications')
-    .where({ user_id: userId, audience })
-    .modify((q) => {
-      if (opts.unreadOnly) q.whereNull('read_at');
-    });
-  const [{ count }] = await base.clone().count<{ count: number }[]>({ count: '*' });
-  const rows = await base
-    .clone()
-    .select('*')
-    .orderBy('created_at', 'desc')
-    .limit(opts.pageSize)
-    .offset((opts.page - 1) * opts.pageSize);
-  const unread = await unreadCount(userId, audience);
-  return { items: rows.map(mapNotification), total: Number(count), unread };
+  const filter: Record<string, unknown> = { user_id: userId, audience, ...(query.unreadOnly ? { read_at: null } : {}) };
+  const [total, rows, unread] = await Promise.all([
+    col('notifications').countDocuments(filter),
+    col('notifications')
+      .find(filter)
+      .sort({ created_at: -1, _id: -1 })
+      .skip((query.page - 1) * query.pageSize)
+      .limit(query.pageSize)
+      .toArray(),
+    unreadCount(userId, audience),
+  ]);
+  return { items: rows.map(mapNotification), total, unread };
 }
 
 export async function unreadCount(userId: string, audience: Audience): Promise<number> {
-  const [{ count }] = await db('notifications')
-    .where({ user_id: userId, audience })
-    .whereNull('read_at')
-    .count<{ count: number }[]>({ count: '*' });
-  return Number(count);
+  return col('notifications').countDocuments({ user_id: userId, audience, read_at: null });
 }
 
 export async function markRead(userId: string, id: string): Promise<void> {
-  const updated = await db('notifications').where({ id, user_id: userId }).update({ read_at: db.raw('COALESCE(read_at, ?)', [now()]) });
-  if (!updated) throw Errors.notFound('Notification');
+  const found = await col('notifications').findOne({ _id: id, user_id: userId }, { projection: { read_at: 1 } });
+  if (!found) throw Errors.notFound('Notification');
+  if (!found.read_at) await col('notifications').updateOne({ _id: id, user_id: userId }, { $set: { read_at: now() } });
 }
 
 export async function markAllRead(userId: string, audience: Audience): Promise<number> {
-  return db('notifications').where({ user_id: userId, audience }).whereNull('read_at').update({ read_at: now() });
+  const result = await col('notifications').updateMany({ user_id: userId, audience, read_at: null }, { $set: { read_at: now() } });
+  return result.modifiedCount;
 }
 
 export async function deleteNotification(userId: string, id: string): Promise<void> {
-  const deleted = await db('notifications').where({ id, user_id: userId }).delete();
-  if (!deleted) throw Errors.notFound('Notification');
+  const result = await col('notifications').deleteOne({ _id: id, user_id: userId });
+  if (!result.deletedCount) throw Errors.notFound('Notification');
 }

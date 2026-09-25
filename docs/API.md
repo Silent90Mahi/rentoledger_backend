@@ -57,7 +57,7 @@ Some lists add extra aggregates to `meta` (counts per status, totals); these are
 ### Data formats
 
 - **IDs** are UUIDs. A malformed ID in a path returns `404 NOT_FOUND`, like an unknown one.
-- **Money** is a JSON number in rupees with up to 2 decimals (`41300`, `14516.13`); stored as `NUMERIC(14,2)`.
+- **Money** is a JSON number in rupees with up to 2 decimals (`41300`, `14516.13`). Arithmetic uses integer paise and every sum is rounded to paise.
 - **Business dates** (`dueDate`, `paidOn`, `startDate`, ...) are `YYYY-MM-DD` strings in the account's time zone.
   Months are `YYYY-MM`. Timestamps (`createdAt`, ...) are ISO-8601 UTC.
 - **Phone numbers** are accepted as `9876543210`, `98765 43210`, `+91 98765 43210` or E.164, and returned in E.164 (`+919876543210`).
@@ -378,19 +378,21 @@ For a signed-in tenant (their phone number is on one or more landlords' tenant r
 
 **Balances come from transactions.** Nothing like "amount due" is stored. Balances are always computed from
 rent entries (`rent_charges`), confirmed payments and their allocations (`payment_allocations`), and deposit transactions.
+Every change that touches money runs in a MongoDB transaction, and the tenant's document is locked for the allocation step,
+so simultaneous payments can never allocate the same rupee twice.
 
 **Billing engine.** Each active agreement produces one `rent` entry per billing period (monthly, quarterly, half-yearly
 or yearly, anchored to the agreement's start month). The due date is `dueDay` of the period's first month, clamped
 to the month's length (a due day of 31 in February falls on the 28th/29th). A partial first or last period is prorated by days when
 `proratePartialPeriods` is on. Escalation raises rent by `escalationPercent` every `escalationIntervalMonths` from the start.
-GST is `baseAmount × gstRate`. Generation is idempotent (unique `agreement_id + period_start`) and runs on every read of
+GST is `baseAmount × gstRate`. Generation is idempotent (a unique index on agreement + period start) and runs on every read of
 the ledger/dashboard (throttled) and in the background scheduler.
 
 **Allocation.** A confirmed payment first pays its target entry (if given), then the oldest unpaid entries (FIFO). Whatever
 is left is **advance credit** and is applied automatically to the next entries as they are created. Editing or voiding a payment,
 voiding an entry or changing an amount re-runs allocation for that tenant.
 
-**Statuses** (computed in SQL with "today" in the account's time zone):
+**Statuses** (computed by the database query with "today" in the account's time zone):
 
 | Status | Rule |
 |---|---|
@@ -406,7 +408,7 @@ voiding an entry or changing an amount re-runs allocation for that tenant.
 `remaining = previousDue + periodTotal − paid`. For example, rent ₹20,000 with ₹10,000 due from before and ₹15,000 paid
 leaves ₹15,000 remaining.
 
-**Reminders.** Every `JOBS_INTERVAL_MINUTES` (a Postgres advisory lock keeps it to one instance) the scheduler generates
+**Reminders.** Every `JOBS_INTERVAL_MINUTES` (a lease document keeps it to one instance) the scheduler generates
 entries, notifies landlords and partners about overdue rent, reminds app-using tenants `reminderDaysBefore` days before
 the due date and again when overdue, and warns about fixed-term agreements ending within 30 days. Every notification has a
 dedupe key, so repeated runs never send duplicates.

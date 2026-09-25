@@ -1,8 +1,9 @@
-import { db } from '../../db/knex.js';
+import type { Document } from 'mongodb';
+import { col, contains, newId, withTransaction } from '../../db/mongo.js';
 import type { Ctx } from '../../lib/context.js';
 import { Errors } from '../../lib/errors.js';
-import { formatInr } from '../../lib/money.js';
-import { likePattern, resolveSort } from '../../lib/validation.js';
+import { formatInr, round2 } from '../../lib/money.js';
+import { resolveSort } from '../../lib/validation.js';
 import { logActivity } from '../activity/activity.service.js';
 
 export const EXPENSE_CATEGORIES = [
@@ -67,13 +68,26 @@ export interface ExpenseDto {
   updatedAt: string;
 }
 
-function expenseQuery(ctx: Ctx) {
-  return db('expenses as e')
-    .leftJoin('units as u', 'u.id', 'e.unit_id')
-    .leftJoin('properties as p', 'p.id', db.raw('COALESCE(e.property_id, u.property_id)'))
-    .leftJoin('users as cb', 'cb.id', 'e.created_by')
-    .where('e.account_id', ctx.accountId)
-    .select('e.*', 'u.name as unit_name', 'p.id as resolved_property_id', 'p.name as property_name', 'cb.name as created_by_name');
+/** Expense documents with unit/property/creator names; the property falls back to the unit's property. */
+function expenseStages(accountId: string, match: Document = {}): Document[] {
+  return [
+    { $match: { ...match, account_id: accountId } },
+    { $lookup: { from: 'units', localField: 'unit_id', foreignField: '_id', pipeline: [{ $project: { name: 1, property_id: 1 } }], as: '_u' } },
+    { $addFields: { _u: { $first: '$_u' } } },
+    { $addFields: { resolved_property_id: { $ifNull: ['$property_id', '$_u.property_id'] } } },
+    { $lookup: { from: 'properties', localField: 'resolved_property_id', foreignField: '_id', pipeline: [{ $project: { name: 1 } }], as: '_p' } },
+    { $lookup: { from: 'users', localField: 'created_by', foreignField: '_id', pipeline: [{ $project: { name: 1 } }], as: '_cb' } },
+    {
+      $addFields: {
+        id: '$_id',
+        unit_name: '$_u.name',
+        resolved_property_id: { $first: '$_p._id' },
+        property_name: { $first: '$_p.name' },
+        created_by_name: { $first: '$_cb.name' },
+      },
+    },
+    { $project: { _u: 0, _p: 0, _cb: 0 } },
+  ];
 }
 
 function mapExpense(r: Record<string, any>): ExpenseDto {
@@ -115,54 +129,58 @@ export async function listExpenses(
 }> {
   const sort = resolveSort(
     opts.sort,
-    { date: 'e.expense_date', amount: 'e.amount', createdAt: 'e.created_at', category: 'e.category' },
-    { column: 'e.expense_date', direction: 'desc' },
+    { date: 'expense_date', amount: 'amount', createdAt: 'created_at', category: 'category' },
+    { column: 'expense_date', direction: 'desc' },
   );
-  const base = expenseQuery(ctx).modify((q) => {
-    if (opts.category) q.where('e.category', opts.category);
-    if (opts.propertyId) q.where('p.id', opts.propertyId);
-    if (opts.unitId) q.where('e.unit_id', opts.unitId);
-    if (opts.from) q.where('e.expense_date', '>=', opts.from);
-    if (opts.to) q.where('e.expense_date', '<=', opts.to);
-    if (opts.search) {
-      const pattern = likePattern(opts.search);
-      q.where((w) => w.whereILike('e.payee', pattern).orWhereILike('e.notes', pattern).orWhereILike('e.reference', pattern).orWhereILike('p.name', pattern));
-    }
-  });
+  const match: Document = {};
+  if (opts.category) match.category = opts.category;
+  if (opts.unitId) match.unit_id = opts.unitId;
+  if (opts.from || opts.to) match.expense_date = { ...(opts.from ? { $gte: opts.from } : {}), ...(opts.to ? { $lte: opts.to } : {}) };
 
-  const byCategory = await db
-    .from(base.clone().as('x'))
-    .select('x.category')
-    .sum({ amount: 'x.amount' })
-    .count({ count: '*' })
-    .groupBy('x.category')
-    .orderBy('amount', 'desc');
-  const count = byCategory.reduce((s: number, r: any) => s + Number(r.count), 0);
-  const amount = byCategory.reduce((s: number, r: any) => s + Number(r.amount), 0);
+  const pipeline = expenseStages(ctx.accountId, match);
+  if (opts.propertyId) pipeline.push({ $match: { resolved_property_id: opts.propertyId } });
+  if (opts.search) {
+    const pattern = contains(opts.search);
+    pipeline.push({ $match: { $or: [{ payee: pattern }, { notes: pattern }, { reference: pattern }, { property_name: pattern }] } });
+  }
 
-  const rows = await base
-    .orderByRaw(`${sort.column} ${sort.direction}, e.created_at DESC, e.id`)
-    .limit(opts.pageSize)
-    .offset((opts.page - 1) * opts.pageSize);
+  const [result] = await col('expenses')
+    .aggregate([
+      ...pipeline,
+      {
+        $facet: {
+          byCategory: [{ $group: { _id: '$category', amount: { $sum: '$amount' }, count: { $sum: 1 } } }, { $sort: { amount: -1 } }],
+          rows: [
+            { $sort: { [sort.column]: sort.direction === 'asc' ? 1 : -1, created_at: -1, _id: 1 } },
+            { $skip: (opts.page - 1) * opts.pageSize },
+            { $limit: opts.pageSize },
+          ],
+        },
+      },
+    ])
+    .toArray();
+  const byCategory = result.byCategory as Array<{ _id: ExpenseCategory; amount: number; count: number }>;
+  const count = byCategory.reduce((s, r) => s + r.count, 0);
+  const amount = byCategory.reduce((s, r) => s + r.amount, 0);
 
   return {
-    items: rows.map(mapExpense),
+    items: result.rows.map(mapExpense),
     total: count,
     summary: {
       count,
-      amount: Math.round(amount * 100) / 100,
-      byCategory: byCategory.map((r: any) => ({
-        category: r.category,
-        label: EXPENSE_CATEGORY_LABELS[r.category as ExpenseCategory] ?? r.category,
-        amount: Number(r.amount),
-        count: Number(r.count),
+      amount: round2(amount),
+      byCategory: byCategory.map((r) => ({
+        category: r._id,
+        label: EXPENSE_CATEGORY_LABELS[r._id] ?? r._id,
+        amount: round2(r.amount),
+        count: r.count,
       })),
     },
   };
 }
 
 export async function getExpense(ctx: Ctx, id: string): Promise<ExpenseDto> {
-  const row = await expenseQuery(ctx).where('e.id', id).first();
+  const [row] = await col('expenses').aggregate(expenseStages(ctx.accountId, { _id: id })).toArray();
   if (!row) throw Errors.notFound('Expense');
   return mapExpense(row);
 }
@@ -170,7 +188,7 @@ export async function getExpense(ctx: Ctx, id: string): Promise<ExpenseDto> {
 async function resolveLocation(ctx: Ctx, propertyId?: string | null, unitId?: string | null) {
   let resolvedProperty = propertyId ?? null;
   if (unitId) {
-    const unit = await db('units').where({ id: unitId, account_id: ctx.accountId }).first('property_id');
+    const unit = await col('units').findOne({ _id: unitId, account_id: ctx.accountId }, { projection: { property_id: 1 } });
     if (!unit) throw Errors.validation('Unit not found.', [{ field: 'unitId', message: 'Unit not found' }]);
     if (resolvedProperty && resolvedProperty !== unit.property_id) {
       throw Errors.validation('The unit does not belong to the selected property.', [{ field: 'unitId', message: 'Wrong property' }]);
@@ -178,7 +196,7 @@ async function resolveLocation(ctx: Ctx, propertyId?: string | null, unitId?: st
     resolvedProperty = unit.property_id;
   }
   if (resolvedProperty) {
-    const property = await db('properties').where({ id: resolvedProperty, account_id: ctx.accountId }).first('id');
+    const property = await col('properties').findOne({ _id: resolvedProperty, account_id: ctx.accountId }, { projection: { _id: 1 } });
     if (!property) throw Errors.validation('Property not found.', [{ field: 'propertyId', message: 'Property not found' }]);
   }
   return { propertyId: resolvedProperty, unitId: unitId ?? null };
@@ -186,9 +204,12 @@ async function resolveLocation(ctx: Ctx, propertyId?: string | null, unitId?: st
 
 export async function createExpense(ctx: Ctx, input: ExpenseInput): Promise<ExpenseDto> {
   const location = await resolveLocation(ctx, input.propertyId, input.unitId);
-  const id = await db.transaction(async (trx) => {
-    const [row] = await trx('expenses')
-      .insert({
+  const id = await withTransaction(async (session) => {
+    const expenseId = newId();
+    const now = new Date();
+    await col('expenses').insertOne(
+      {
+        _id: expenseId,
         account_id: ctx.accountId,
         property_id: location.propertyId,
         unit_id: location.unitId,
@@ -200,21 +221,24 @@ export async function createExpense(ctx: Ctx, input: ExpenseInput): Promise<Expe
         reference: input.reference ?? null,
         notes: input.notes ?? null,
         created_by: ctx.userId,
-      })
-      .returning('id');
-    await logActivity(trx, ctx, {
+        created_at: now,
+        updated_at: now,
+      },
+      { session },
+    );
+    await logActivity(session, ctx, {
       action: 'expense.created',
       entityType: 'expense',
-      entityId: row.id,
+      entityId: expenseId,
       summary: `Added ${EXPENSE_CATEGORY_LABELS[input.category].toLowerCase()} expense of ${formatInr(input.amount)}${input.payee ? ` to ${input.payee}` : ''}`,
     });
-    return row.id as string;
+    return expenseId;
   });
   return getExpense(ctx, id);
 }
 
 export async function updateExpense(ctx: Ctx, id: string, input: Partial<ExpenseInput>): Promise<ExpenseDto> {
-  const existing = await db('expenses').where({ id, account_id: ctx.accountId }).first();
+  const existing = await col('expenses').findOne({ _id: id, account_id: ctx.accountId });
   if (!existing) throw Errors.notFound('Expense');
   const changes: Record<string, unknown> = {};
   if (input.propertyId !== undefined || input.unitId !== undefined) {
@@ -234,9 +258,9 @@ export async function updateExpense(ctx: Ctx, id: string, input: Partial<Expense
   if (input.reference !== undefined) changes.reference = input.reference;
   if (input.notes !== undefined) changes.notes = input.notes;
   if (Object.keys(changes).length) {
-    await db.transaction(async (trx) => {
-      await trx('expenses').where({ id }).update(changes);
-      await logActivity(trx, ctx, {
+    await withTransaction(async (session) => {
+      await col('expenses').updateOne({ _id: id }, { $set: { ...changes, updated_at: new Date() } }, { session });
+      await logActivity(session, ctx, {
         action: 'expense.updated',
         entityType: 'expense',
         entityId: id,
@@ -248,11 +272,11 @@ export async function updateExpense(ctx: Ctx, id: string, input: Partial<Expense
 }
 
 export async function deleteExpense(ctx: Ctx, id: string): Promise<void> {
-  const existing = await db('expenses').where({ id, account_id: ctx.accountId }).first();
+  const existing = await col('expenses').findOne({ _id: id, account_id: ctx.accountId });
   if (!existing) throw Errors.notFound('Expense');
-  await db.transaction(async (trx) => {
-    await trx('expenses').where({ id }).delete();
-    await logActivity(trx, ctx, {
+  await withTransaction(async (session) => {
+    await col('expenses').deleteOne({ _id: id }, { session });
+    await logActivity(session, ctx, {
       action: 'expense.deleted',
       entityType: 'expense',
       entityId: id,

@@ -47,21 +47,3 @@ export const Errors = {
   tooMany: (message = 'Too many requests. Please try again later.') => new AppError(429, 'TOO_MANY_REQUESTS', message),
   unavailable: (message = 'Service temporarily unavailable.') => new AppError(503, 'SERVICE_UNAVAILABLE', message),
 };
-
-/** Postgres error codes we translate into client-facing errors. */
-export const PG_ERRORS = {
-  UNIQUE_VIOLATION: '23505',
-  FOREIGN_KEY_VIOLATION: '23503',
-  CHECK_VIOLATION: '23514',
-  NOT_NULL_VIOLATION: '23502',
-  INVALID_TEXT_REPRESENTATION: '22P02',
-  INVALID_DATETIME: '22007',
-  DATETIME_OVERFLOW: '22008',
-  NUMERIC_OUT_OF_RANGE: '22003',
-  STRING_TOO_LONG: '22001',
-} as const;
-
-export function isPgError(error: unknown): error is { code: string; constraint?: string; detail?: string } {
-  return typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string' &&
-    /^[0-9A-Z]{5}$/.test((error as { code: string }).code);
-}

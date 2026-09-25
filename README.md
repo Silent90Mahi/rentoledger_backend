@@ -4,8 +4,8 @@ Node.js REST API for RentOLedger: properties, units, tenants, agreements, rent e
 reports, notifications and the tenant portal. It is a standalone service. The Flutter app talks to it over HTTP
 only, so it can be deployed on its own.
 
-**Stack:** Node.js ≥ 20.12 · TypeScript · Express 5 · PostgreSQL (Knex + pg) · Zod validation · JWT + rotating refresh tokens ·
-pino logging · Vitest + Supertest.
+**Stack:** Node.js ≥ 20.12 · TypeScript · Express 5 · MongoDB 6+ (official driver, replica-set transactions) · Zod validation ·
+JWT + rotating refresh tokens · pino logging · Vitest + Supertest.
 
 ## Run locally
 
@@ -17,9 +17,9 @@ npm run dev
 `npm run dev` needs no database install:
 
 1. Loads `.env` if present (optional; see [.env.example](.env.example)).
-2. Uses `DATABASE_URL` if set. Otherwise it starts an **embedded PostgreSQL** in `./.data/postgres` on port 54329.
-   The first run downloads nothing extra (the binaries come with the `embedded-postgres` dev dependency) and initialises the cluster.
-3. Applies migrations, and loads demo data if the database is empty.
+2. Uses `MONGODB_URI` if set. Otherwise it starts a **local single-node MongoDB replica set** in `./.data/mongo` on port 27027
+   (via the `mongodb-memory-server` dev dependency; the first run downloads the official `mongod` binary once and caches it).
+3. Creates the indexes, and loads demo data if the database is empty.
 4. Starts the API on **http://localhost:4000/api/v1** with auto-restart on file changes and the background scheduler.
 
 In development the OTP code is always **123456** and is also returned by `/auth/otp/request` (`devCode`).
@@ -32,18 +32,17 @@ Check it: `curl http://localhost:4000/ready`
 | Command | What it does |
 |---|---|
 | `npm run dev` | Local API + embedded database + demo data, with watch mode |
-| `npm test` | Test suite (starts its own embedded PostgreSQL on port 54330, separate from dev data) |
+| `npm test` | Test suite (starts its own throwaway in-memory MongoDB replica set, separate from dev data) |
 | `npm run typecheck` | TypeScript check of `src`, `scripts` and `tests` |
 | `npm run build` | Compile to `dist/` |
 | `npm start` | Run the compiled server (`node dist/src/server.js`) |
-| `npm run db:migrate` | Apply pending migrations |
-| `npm run db:rollback` | Undo the last migration batch |
+| `npm run db:migrate` | Create collections and indexes (idempotent; the server also does this on start) |
 | `npm run db:seed` | Load demo data into an empty database |
-| `npm run db:reset` | Drop everything, migrate and load fresh demo data (refused in production) |
+| `npm run db:reset` | Drop the database, recreate indexes and load fresh demo data (refused in production) |
 | `npm run jobs:run` | Run the scheduled jobs once (rent generation, reminders, cleanup) and print a report |
-| `npm run migrate:prod` | Apply migrations with the compiled build (production) |
+| `npm run migrate:prod` | Create indexes with the compiled build (production) |
 
-The `db:*` and `jobs:run` scripts use `DATABASE_URL` when set, otherwise the embedded development database
+The `db:*` and `jobs:run` scripts use `MONGODB_URI` when set, otherwise the local development database
 (reusing it if `npm run dev` is already running).
 
 ## Configuration
@@ -51,7 +50,7 @@ The `db:*` and `jobs:run` scripts use `DATABASE_URL` when set, otherwise the emb
 All settings are environment variables, validated at startup ([src/config/env.ts](src/config/env.ts)).
 [.env.example](.env.example) documents each one. In production the server refuses to start without:
 
-- `DATABASE_URL`
+- `MONGODB_URI` pointing at a **replica set** (MongoDB Atlas, or `mongod --replSet`): transactions need one
 - `JWT_ACCESS_SECRET` (≥ 32 chars) and `OTP_SECRET` (≥ 16 chars). Generate them with `openssl rand -hex 32`.
 - A real SMS provider (`SMS_PROVIDER=twilio` + `TWILIO_*`), unless you explicitly set `ALLOW_CONSOLE_SMS_IN_PRODUCTION=true`.
 
@@ -61,27 +60,28 @@ It also refuses a `DEV_OTP_CODE`. Set `CORS_ORIGINS` to the web app's origin(s) 
 
 ```
 src/
-  server.ts            process entry: waits for the DB, optional auto-migrate, HTTP server, scheduler, graceful shutdown
+  server.ts            process entry: waits for the DB, ensures indexes, HTTP server, scheduler, graceful shutdown
   app.ts               Express app: request IDs + logging, helmet, CORS, JSON body limit, health/ready, API router, errors
   routes.ts            mounts module routers with auth/role guards
   config/              env validation, logger
-  db/                  Knex pool, migration runner + migrations, CLI, demo seed
-  jobs/                scheduler (advisory-locked), reminder/cleanup tasks, one-off runner
+  db/                  MongoDB client + transaction helper, indexes (uniqueness rules), CLI, demo seed
+  jobs/                scheduler (lease-locked), reminder/cleanup tasks, one-off runner
   lib/                 dates (pure YYYY-MM-DD maths), money, phone normalisation, validation helpers, errors, HTTP envelope
   middleware/          authentication/roles, rate limits, error handler
-  modules/<feature>/   *.routes.ts (HTTP + Zod schemas) and *.service.ts (business logic + SQL)
+  modules/<feature>/   *.routes.ts (HTTP + Zod schemas) and *.service.ts (business logic + queries)
     rents/billing.ts         pure billing engine (periods, proration, escalation, GST)
     rents/generation.service idempotent rent-entry generation
     payments/allocation      applies payments to entries (target first, then oldest), advance credit
-    finance/finance.queries  shared balance/collection SQL used by dashboard, reports and tenants
-scripts/               dev launcher, embedded PostgreSQL helper, dev DB wrapper for CLI scripts
-tests/                 API and engine tests against a real PostgreSQL
+    rents/charge-query       aggregation stages deriving paid/balance/status of rent entries
+    finance/finance.queries  shared balance/collection aggregations used by dashboard, reports and tenants
+scripts/               dev launcher, local MongoDB helper, dev DB wrapper for CLI scripts
+tests/                 API, engine and concurrency tests against a real MongoDB replica set
 docs/API.md            API reference
 ```
 
 ## Deploying
 
-The API is a stateless container or Node process plus PostgreSQL 13 or newer.
+The API is a stateless container or Node process plus MongoDB 6.0 or newer running as a replica set (MongoDB Atlas works out of the box).
 
 **Docker**
 
@@ -91,10 +91,10 @@ docker run -p 4000:4000 --env-file .env.production rentoledger-api
 ```
 
 The image is multi-stage, runs as a non-root user and has a `HEALTHCHECK` on `/health`.
-Migrations run either as a release step (`node dist/src/db/cli.js migrate`) or on boot with `DB_AUTO_MIGRATE=true`.
-Knex's migration lock makes that safe when several instances start together.
+Indexes (which also carry the uniqueness rules) are created on boot; creating an existing index is a no-op, so several
+instances can start together. `node dist/src/db/cli.js migrate` does the same as a separate release step.
 
-**docker compose** (API + PostgreSQL, production mode):
+**docker compose** (API + MongoDB single-node replica set, production mode):
 
 ```bash
 export JWT_ACCESS_SECRET=$(openssl rand -hex 32) OTP_SECRET=$(openssl rand -hex 32)
@@ -106,16 +106,17 @@ docker compose exec api node dist/src/db/cli.js seed --force   # optional: demo 
 
 ```bash
 npm ci && npm run build && npm prune --omit=dev
-NODE_ENV=production DATABASE_URL=... JWT_ACCESS_SECRET=... OTP_SECRET=... npm run migrate:prod
+NODE_ENV=production MONGODB_URI=... JWT_ACCESS_SECRET=... OTP_SECRET=... npm run migrate:prod
 NODE_ENV=production ... npm start
 ```
 
 Operational notes:
 
 - **Health:** `/health` (liveness) and `/ready` (checks the database) are unauthenticated and outside the API prefix.
-- **Scaling out:** scheduled jobs take a Postgres advisory lock, so only one instance runs them per cycle.
+- **Scaling out:** scheduled jobs take a lease document in the `locks` collection, so only one instance runs them per cycle.
   Set `JOBS_ENABLED=false` on instances that should only serve HTTP.
-- **Managed Postgres:** set `DATABASE_SSL=true` (and `DATABASE_SSL_REJECT_UNAUTHORIZED=false` only if the provider uses a self-signed CA).
+- **MongoDB Atlas:** use the `mongodb+srv://` connection string it gives you (TLS and credentials are in the URI) and allow the server's IP in Network Access.
+- **Backups:** use Atlas backups, or `mongodump --uri "$MONGODB_URI" --archive=backup.gz --gzip` on a schedule.
 - **Logs** are JSON on stdout (pino). Tokens, OTP codes and authorization headers are redacted. Every request has an `X-Request-Id`.
 - **Shutdown:** on SIGTERM it stops the scheduler, drains HTTP connections and closes the pool (15 s limit).
 

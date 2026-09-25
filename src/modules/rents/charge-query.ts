@@ -1,4 +1,5 @@
-import type { Knex } from 'knex';
+import type { Document } from 'mongodb';
+import { $round2, col, type Session } from '../../db/mongo.js';
 import { diffDays, endOfMonth, humanDate, monthKeyOf, monthLabel, shortMonthLabel, startOfMonth } from '../../lib/dates.js';
 
 export type ChargeStatus = 'collected' | 'to_confirm' | 'overdue' | 'pending' | 'void';
@@ -7,92 +8,105 @@ export type ChargeKind = 'rent' | 'opening_balance' | 'maintenance' | 'utility' 
 export type ChargeScope = { accountId: string } | { tenantIds: string[] };
 
 /**
- * Base query for rent entries with their live financial state, derived purely
- * from transactions:
+ * Aggregation stages for rent entries with their live financial state,
+ * derived purely from transactions:
  *   paid_amount = sum of allocations, balance = total - paid,
  *   status      = void | collected | to_confirm | overdue | pending.
- * Wrap it as a subquery (`.as('lc')`) to filter or sort on computed columns.
+ * Output documents use the same field names as `rent_charges` plus `id`
+ * and the computed fields; add `$match`/`$sort`/`$group` stages after them.
  */
-export function chargeQuery(q: Knex | Knex.Transaction, scope: ChargeScope, today: string): Knex.QueryBuilder {
-  const byAccount = 'accountId' in scope;
+export function chargeStatusStages(scope: ChargeScope, today: string, match: Document = {}): Document[] {
+  const scopeMatch = 'accountId' in scope ? { account_id: scope.accountId } : { tenant_id: { $in: scope.tenantIds } };
+  return [
+    { $match: { ...scopeMatch, ...match } },
+    {
+      $lookup: {
+        from: 'payment_allocations',
+        localField: '_id',
+        foreignField: 'charge_id',
+        pipeline: [{ $project: { amount: 1 } }],
+        as: '_al',
+      },
+    },
+    {
+      $lookup: {
+        from: 'payments',
+        localField: '_id',
+        foreignField: 'target_charge_id',
+        pipeline: [{ $match: { status: 'pending' } }, { $project: { amount: 1 } }],
+        as: '_pnd',
+      },
+    },
+    {
+      $addFields: {
+        id: '$_id',
+        paid_amount: $round2({ $sum: '$_al.amount' }),
+        pending_amount: $round2({ $sum: '$_pnd.amount' }),
+        pending_count: { $size: '$_pnd' },
+      },
+    },
+    { $addFields: { balance: $round2({ $subtract: ['$total_amount', '$paid_amount'] }) } },
+    {
+      $addFields: {
+        status: {
+          $switch: {
+            branches: [
+              { case: { $ne: [{ $ifNull: ['$voided_at', null] }, null] }, then: 'void' },
+              { case: { $lte: ['$balance', 0] }, then: 'collected' },
+              { case: { $gt: ['$pending_count', 0] }, then: 'to_confirm' },
+              { case: { $lt: ['$due_date', today] }, then: 'overdue' },
+            ],
+            default: 'pending',
+          },
+        },
+        is_overdue: {
+          $and: [{ $eq: [{ $ifNull: ['$voided_at', null] }, null] }, { $gt: ['$balance', 0] }, { $lt: ['$due_date', today] }],
+        },
+        is_partial: {
+          $and: [{ $eq: [{ $ifNull: ['$voided_at', null] }, null] }, { $gt: ['$paid_amount', 0] }, { $gt: ['$balance', 0] }],
+        },
+      },
+    },
+    { $project: { _al: 0, _pnd: 0, lock_version: 0 } },
+  ];
+}
 
-  const allocations = q('payment_allocations as pa')
-    .select('pa.charge_id')
-    .sum({ paid: 'pa.amount' })
-    .groupBy('pa.charge_id')
-    .modify((sq) => {
-      if (byAccount) sq.where('pa.account_id', scope.accountId);
-      else sq.whereIn('pa.charge_id', q('rent_charges').select('id').whereIn('tenant_id', scope.tenantIds));
-    });
+/** Adds tenant/unit/property names to each entry. */
+export function chargeRefStages(): Document[] {
+  return [
+    { $lookup: { from: 'tenants', localField: 'tenant_id', foreignField: '_id', pipeline: [{ $project: { name: 1, phone: 1, business_name: 1 } }], as: '_t' } },
+    { $lookup: { from: 'units', localField: 'unit_id', foreignField: '_id', pipeline: [{ $project: { name: 1, type: 1, property_id: 1 } }], as: '_u' } },
+    { $addFields: { _t: { $first: '$_t' }, _u: { $first: '$_u' } } },
+    { $lookup: { from: 'properties', localField: '_u.property_id', foreignField: '_id', pipeline: [{ $project: { name: 1, type: 1 } }], as: '_p' } },
+    { $addFields: { _p: { $first: '$_p' } } },
+    {
+      $addFields: {
+        tenant_name: '$_t.name',
+        tenant_phone: '$_t.phone',
+        tenant_business_name: '$_t.business_name',
+        unit_name: '$_u.name',
+        unit_type: '$_u.type',
+        property_id: '$_p._id',
+        property_name: '$_p.name',
+        property_type: '$_p.type',
+      },
+    },
+    { $project: { _t: 0, _u: 0, _p: 0 } },
+  ];
+}
 
-  const pendingPayments = q('payments as pp')
-    .select('pp.target_charge_id')
-    .sum({ pending_amount: 'pp.amount' })
-    .count({ pending_count: '*' })
-    .where('pp.status', 'pending')
-    .whereNotNull('pp.target_charge_id')
-    .groupBy('pp.target_charge_id')
-    .modify((sq) => {
-      if (byAccount) sq.where('pp.account_id', scope.accountId);
-      else sq.whereIn('pp.tenant_id', scope.tenantIds);
-    });
-
-  return q('rent_charges as c')
-    .join('tenants as t', 't.id', 'c.tenant_id')
-    .join('units as u', 'u.id', 'c.unit_id')
-    .join('properties as p', 'p.id', 'u.property_id')
-    .leftJoin(allocations.as('al'), 'al.charge_id', 'c.id')
-    .leftJoin(pendingPayments.as('pnd'), 'pnd.target_charge_id', 'c.id')
-    .modify((qb) => {
-      if (byAccount) qb.where('c.account_id', scope.accountId);
-      else qb.whereIn('c.tenant_id', scope.tenantIds);
-    })
-    .select(
-      'c.id',
-      'c.account_id',
-      'c.agreement_id',
-      'c.tenant_id',
-      'c.unit_id',
-      'c.kind',
-      'c.description',
-      'c.period_start',
-      'c.period_end',
-      'c.due_date',
-      'c.base_amount',
-      'c.gst_rate',
-      'c.gst_amount',
-      'c.total_amount',
-      'c.voided_at',
-      'c.void_reason',
-      'c.created_at',
-      't.name as tenant_name',
-      't.phone as tenant_phone',
-      't.business_name as tenant_business_name',
-      'u.name as unit_name',
-      'u.type as unit_type',
-      'p.id as property_id',
-      'p.name as property_name',
-      'p.type as property_type',
-      q.raw('COALESCE(al.paid, 0) AS paid_amount'),
-      q.raw('c.total_amount - COALESCE(al.paid, 0) AS balance'),
-      q.raw('COALESCE(pnd.pending_amount, 0) AS pending_amount'),
-      q.raw('COALESCE(pnd.pending_count, 0) AS pending_count'),
-      q.raw(
-        `CASE
-           WHEN c.voided_at IS NOT NULL THEN 'void'
-           WHEN c.total_amount - COALESCE(al.paid, 0) <= 0 THEN 'collected'
-           WHEN COALESCE(pnd.pending_count, 0) > 0 THEN 'to_confirm'
-           WHEN c.due_date < ?::date THEN 'overdue'
-           ELSE 'pending'
-         END AS status`,
-        [today],
-      ),
-      q.raw(
-        '(c.voided_at IS NULL AND c.total_amount - COALESCE(al.paid, 0) > 0 AND c.due_date < ?::date) AS is_overdue',
-        [today],
-      ),
-      q.raw('(c.voided_at IS NULL AND COALESCE(al.paid, 0) > 0 AND c.total_amount - COALESCE(al.paid, 0) > 0) AS is_partial'),
-    );
+/** Full rows (status + names) matching `match`, e.g. `{ _id: id }` or `{ agreement_id }`. */
+export async function findCharges(
+  scope: ChargeScope,
+  today: string,
+  match: Document = {},
+  options: { sort?: Document; limit?: number; session?: Session } = {},
+): Promise<Array<Record<string, any>>> {
+  const pipeline: Document[] = [...chargeStatusStages(scope, today, match)];
+  if (options.sort) pipeline.push({ $sort: options.sort });
+  if (options.limit) pipeline.push({ $limit: options.limit });
+  pipeline.push(...chargeRefStages());
+  return col('rent_charges').aggregate(pipeline, options.session ? { session: options.session } : {}).toArray();
 }
 
 export interface RentEntryDto {

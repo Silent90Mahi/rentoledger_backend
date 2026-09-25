@@ -1,4 +1,5 @@
-import type { Knex } from 'knex';
+import { col, round2, type Session } from '../../db/mongo.js';
+import { chargeStatusStages } from '../rents/charge-query.js';
 
 /**
  * Shared financial aggregations. Everything is derived from transactions:
@@ -6,11 +7,35 @@ import type { Knex } from 'knex';
  * what it settled) and expenses (money out).
  */
 
-type Q = Knex | Knex.Transaction;
+const sessionOpt = (session?: Session) => (session ? { session } : {});
 
-/** Allocation totals per charge for an account (sub-select). */
-export function allocationTotals(q: Q, accountId: string): Knex.QueryBuilder {
-  return q('payment_allocations').select('charge_id').sum({ paid: 'amount' }).where('account_id', accountId).groupBy('charge_id');
+/** Confirmed allocations per charge id. */
+export async function paidByCharge(chargeIds: string[], session?: Session): Promise<Map<string, number>> {
+  if (chargeIds.length === 0) return new Map();
+  const rows = await col('payment_allocations')
+    .aggregate([{ $match: { charge_id: { $in: chargeIds } } }, { $group: { _id: '$charge_id', paid: { $sum: '$amount' } } }], sessionOpt(session))
+    .toArray();
+  return new Map(rows.map((r) => [r._id as string, round2(r.paid)]));
+}
+
+/** Allocated amount per payment id. */
+export async function allocatedByPayment(paymentIds: string[], session?: Session): Promise<Map<string, number>> {
+  if (paymentIds.length === 0) return new Map();
+  const rows = await col('payment_allocations')
+    .aggregate([{ $match: { payment_id: { $in: paymentIds } } }, { $group: { _id: '$payment_id', allocated: { $sum: '$amount' } } }], sessionOpt(session))
+    .toArray();
+  return new Map(rows.map((r) => [r._id as string, round2(r.allocated)]));
+}
+
+/** unit id -> property id for the given units (or every unit of the account). */
+async function unitPropertyMap(accountId: string, unitIds?: string[]): Promise<Map<string, string>> {
+  const filter = unitIds ? { account_id: accountId, _id: { $in: unitIds } } : { account_id: accountId };
+  const units = await col('units').find(filter, { projection: { property_id: 1 } }).toArray();
+  return new Map(units.map((u) => [u._id, u.property_id as string]));
+}
+
+function addTo<K>(map: Map<K, number>, key: K, amount: number) {
+  map.set(key, round2((map.get(key) ?? 0) + amount));
 }
 
 /**
@@ -18,88 +43,90 @@ export function allocationTotals(q: Q, accountId: string): Knex.QueryBuilder {
  * down by property. Money applied to a charge is attributed to the charge's
  * property; unapplied (advance) money is attributed via the payment's unit.
  */
-export async function collectedByProperty(
-  q: Q,
-  accountId: string,
-  from: string,
-  to: string,
-): Promise<Map<string | null, number>> {
-  const { rows } = await q.raw<{ rows: Array<{ property_id: string | null; amount: number }> }>(
-    `WITH pay AS (
-       SELECT p.id, p.amount, p.unit_id
-         FROM payments p
-        WHERE p.account_id = ? AND p.status = 'confirmed' AND p.paid_on BETWEEN ?::date AND ?::date
-     ),
-     applied AS (
-       SELECT u.property_id, SUM(pa.amount) AS amount
-         FROM pay
-         JOIN payment_allocations pa ON pa.payment_id = pay.id
-         JOIN rent_charges c ON c.id = pa.charge_id
-         JOIN units u ON u.id = c.unit_id
-        GROUP BY u.property_id
-     ),
-     unapplied AS (
-       SELECT u.property_id, SUM(pay.amount - COALESCE(x.allocated, 0)) AS amount
-         FROM pay
-         LEFT JOIN (SELECT payment_id, SUM(amount) AS allocated FROM payment_allocations GROUP BY payment_id) x
-                ON x.payment_id = pay.id
-         LEFT JOIN units u ON u.id = pay.unit_id
-        WHERE pay.amount - COALESCE(x.allocated, 0) > 0
-        GROUP BY u.property_id
-     )
-     SELECT property_id, SUM(amount) AS amount
-       FROM (SELECT * FROM applied UNION ALL SELECT * FROM unapplied) t
-      GROUP BY property_id`,
-    [accountId, from, to],
-  );
-  return new Map(rows.map((r) => [r.property_id, Number(r.amount)]));
+export async function collectedByProperty(accountId: string, from: string, to: string): Promise<Map<string | null, number>> {
+  const payments = await col('payments')
+    .find({ account_id: accountId, status: 'confirmed', paid_on: { $gte: from, $lte: to } }, { projection: { amount: 1, unit_id: 1 } })
+    .toArray();
+  const result = new Map<string | null, number>();
+  if (payments.length === 0) return result;
+
+  const allocations = await col('payment_allocations')
+    .find({ payment_id: { $in: payments.map((p) => p._id) } }, { projection: { payment_id: 1, charge_id: 1, amount: 1 } })
+    .toArray();
+  const charges = await col('rent_charges')
+    .find({ _id: { $in: [...new Set(allocations.map((a) => a.charge_id))] } }, { projection: { unit_id: 1 } })
+    .toArray();
+  const chargeUnit = new Map(charges.map((c) => [c._id, c.unit_id as string]));
+  const unitProperty = await unitPropertyMap(accountId);
+
+  const allocatedPerPayment = new Map<string, number>();
+  for (const a of allocations) {
+    addTo(result, unitProperty.get(chargeUnit.get(a.charge_id) ?? '') ?? null, a.amount);
+    addTo(allocatedPerPayment, a.payment_id, a.amount);
+  }
+  for (const p of payments) {
+    const unapplied = round2(p.amount - (allocatedPerPayment.get(p._id) ?? 0));
+    if (unapplied > 0) addTo(result, p.unit_id ? (unitProperty.get(p.unit_id) ?? null) : null, unapplied);
+  }
+  return result;
 }
 
-export async function expensesByProperty(q: Q, accountId: string, from: string, to: string): Promise<Map<string | null, number>> {
-  const rows = await q('expenses as e')
-    .leftJoin('units as u', 'u.id', 'e.unit_id')
-    .where('e.account_id', accountId)
-    .whereBetween('e.expense_date', [from, to])
-    .select(q.raw('COALESCE(e.property_id, u.property_id) AS property_id'))
-    .sum({ amount: 'e.amount' })
-    .groupByRaw('COALESCE(e.property_id, u.property_id)');
-  return new Map(rows.map((r: any) => [r.property_id, Number(r.amount)]));
+export async function expensesByProperty(accountId: string, from: string, to: string): Promise<Map<string | null, number>> {
+  const rows = await col('expenses')
+    .aggregate([
+      { $match: { account_id: accountId, expense_date: { $gte: from, $lte: to } } },
+      { $group: { _id: { property_id: '$property_id', unit_id: '$unit_id' }, amount: { $sum: '$amount' } } },
+    ])
+    .toArray();
+  const unitProperty = await unitPropertyMap(accountId);
+  const result = new Map<string | null, number>();
+  for (const r of rows) {
+    const propertyId = r._id.property_id ?? (r._id.unit_id ? (unitProperty.get(r._id.unit_id) ?? null) : null);
+    addTo(result, propertyId, r.amount);
+  }
+  return result;
 }
 
 /** Rent due (charges by due date) in [from, to] per property. */
-export async function expectedByProperty(q: Q, accountId: string, from: string, to: string): Promise<Map<string, number>> {
-  const rows = await q('rent_charges as c')
-    .join('units as u', 'u.id', 'c.unit_id')
-    .where('c.account_id', accountId)
-    .whereNull('c.voided_at')
-    .whereNot('c.kind', 'opening_balance')
-    .whereBetween('c.due_date', [from, to])
-    .select('u.property_id')
-    .sum({ amount: 'c.total_amount' })
-    .groupBy('u.property_id');
-  return new Map(rows.map((r: any) => [r.property_id, Number(r.amount)]));
+export async function expectedByProperty(accountId: string, from: string, to: string): Promise<Map<string, number>> {
+  const rows = await col('rent_charges')
+    .aggregate([
+      { $match: { account_id: accountId, voided_at: null, kind: { $ne: 'opening_balance' }, due_date: { $gte: from, $lte: to } } },
+      { $group: { _id: '$unit_id', amount: { $sum: '$total_amount' } } },
+    ])
+    .toArray();
+  const unitProperty = await unitPropertyMap(accountId);
+  const result = new Map<string, number>();
+  for (const r of rows) {
+    const propertyId = unitProperty.get(r._id);
+    if (propertyId) addTo(result, propertyId, r.amount);
+  }
+  return result;
 }
 
 /** Outstanding and overdue balances per property as of `today`. */
-export async function duesByProperty(
-  q: Q,
-  accountId: string,
-  today: string,
-): Promise<Map<string, { outstanding: number; overdue: number }>> {
-  const rows = await q('rent_charges as c')
-    .join('units as u', 'u.id', 'c.unit_id')
-    .leftJoin(allocationTotals(q, accountId).as('al'), 'al.charge_id', 'c.id')
-    .where('c.account_id', accountId)
-    .whereNull('c.voided_at')
-    .select('u.property_id')
-    .select(q.raw('SUM(c.total_amount - COALESCE(al.paid, 0)) AS outstanding'))
-    .select(
-      q.raw('SUM(CASE WHEN c.due_date < ?::date THEN c.total_amount - COALESCE(al.paid, 0) ELSE 0 END) AS overdue', [today]),
-    )
-    .groupBy('u.property_id');
-  return new Map(
-    rows.map((r: any) => [r.property_id, { outstanding: Number(r.outstanding), overdue: Number(r.overdue) }]),
-  );
+export async function duesByProperty(accountId: string, today: string): Promise<Map<string, { outstanding: number; overdue: number }>> {
+  const rows = await col('rent_charges')
+    .aggregate([
+      ...chargeStatusStages({ accountId }, today, { voided_at: null }),
+      {
+        $group: {
+          _id: '$unit_id',
+          outstanding: { $sum: '$balance' },
+          overdue: { $sum: { $cond: [{ $lt: ['$due_date', today] }, '$balance', 0] } },
+        },
+      },
+    ])
+    .toArray();
+  const unitProperty = await unitPropertyMap(accountId);
+  const result = new Map<string, { outstanding: number; overdue: number }>();
+  for (const r of rows) {
+    const propertyId = unitProperty.get(r._id);
+    if (!propertyId) continue;
+    const current = result.get(propertyId) ?? { outstanding: 0, overdue: 0 };
+    result.set(propertyId, { outstanding: round2(current.outstanding + r.outstanding), overdue: round2(current.overdue + r.overdue) });
+  }
+  return result;
 }
 
 export interface TenantFinancials {
@@ -113,8 +140,12 @@ export interface TenantFinancials {
   pendingConfirmation: number;
 }
 
-/** Per-tenant financial summary as of `today`. */
-export async function tenantFinancials(q: Q, accountId: string, tenantIds: string[], today: string): Promise<Map<string, TenantFinancials>> {
+/**
+ * Balance per tenant: charged, outstanding and overdue are summed from each
+ * live entry's total minus what has been allocated to it; paid, advance and
+ * pending come from the tenant's payments.
+ */
+export async function tenantFinancials(accountId: string, tenantIds: string[], today: string): Promise<Map<string, TenantFinancials>> {
   const result = new Map<string, TenantFinancials>();
   if (tenantIds.length === 0) return result;
   for (const id of tenantIds) {
@@ -130,67 +161,68 @@ export async function tenantFinancials(q: Q, accountId: string, tenantIds: strin
     });
   }
 
-  const charges = await q('rent_charges as c')
-    .leftJoin(allocationTotals(q, accountId).as('al'), 'al.charge_id', 'c.id')
-    .where('c.account_id', accountId)
-    .whereIn('c.tenant_id', tenantIds)
-    .whereNull('c.voided_at')
-    .select('c.tenant_id')
-    .select(q.raw('SUM(c.total_amount) AS charged'))
-    .select(q.raw('SUM(c.total_amount - COALESCE(al.paid, 0)) AS outstanding'))
-    .select(q.raw('SUM(CASE WHEN c.due_date < ?::date THEN c.total_amount - COALESCE(al.paid, 0) ELSE 0 END) AS overdue', [today]))
-    .groupBy('c.tenant_id');
-  for (const r of charges as any[]) {
-    const f = result.get(r.tenant_id)!;
-    f.totalCharged = Number(r.charged);
-    f.outstanding = Number(r.outstanding);
-    f.overdue = Number(r.overdue);
+  const [charges, payments, deposits] = await Promise.all([
+    col('rent_charges')
+      .aggregate([
+        ...chargeStatusStages({ accountId }, today, { tenant_id: { $in: tenantIds }, voided_at: null }),
+        {
+          $group: {
+            _id: '$tenant_id',
+            charged: { $sum: '$total_amount' },
+            outstanding: { $sum: '$balance' },
+            overdue: { $sum: { $cond: [{ $lt: ['$due_date', today] }, '$balance', 0] } },
+          },
+        },
+      ])
+      .toArray(),
+    col('payments')
+      .find({ account_id: accountId, tenant_id: { $in: tenantIds }, status: { $in: ['confirmed', 'pending'] } }, { projection: { tenant_id: 1, amount: 1, status: 1 } })
+      .toArray(),
+    col('deposit_transactions')
+      .aggregate([
+        { $match: { account_id: accountId, tenant_id: { $in: tenantIds } } },
+        { $group: { _id: '$tenant_id', held: { $sum: { $cond: [{ $eq: ['$type', 'received'] }, '$amount', { $multiply: ['$amount', -1] }] } } } },
+      ])
+      .toArray(),
+  ]);
+
+  for (const r of charges) {
+    const f = result.get(r._id)!;
+    f.totalCharged = round2(r.charged);
+    f.outstanding = round2(r.outstanding);
+    f.overdue = round2(r.overdue);
   }
 
-  const payments = await q('payments as p')
-    .leftJoin(
-      q('payment_allocations').select('payment_id').sum({ allocated: 'amount' }).where('account_id', accountId).groupBy('payment_id').as('x'),
-      'x.payment_id',
-      'p.id',
-    )
-    .where('p.account_id', accountId)
-    .whereIn('p.tenant_id', tenantIds)
-    .whereIn('p.status', ['confirmed', 'pending'])
-    .select('p.tenant_id')
-    .select(q.raw(`SUM(CASE WHEN p.status = 'confirmed' THEN p.amount ELSE 0 END) AS paid`))
-    .select(q.raw(`SUM(CASE WHEN p.status = 'confirmed' THEN p.amount - COALESCE(x.allocated, 0) ELSE 0 END) AS advance`))
-    .select(q.raw(`SUM(CASE WHEN p.status = 'pending' THEN p.amount ELSE 0 END) AS pending`))
-    .groupBy('p.tenant_id');
-  for (const r of payments as any[]) {
-    const f = result.get(r.tenant_id)!;
-    f.totalPaid = Number(r.paid);
-    f.advanceCredit = Number(r.advance);
-    f.pendingConfirmation = Number(r.pending);
+  const allocated = await allocatedByPayment(payments.filter((p) => p.status === 'confirmed').map((p) => p._id));
+  for (const p of payments) {
+    const f = result.get(p.tenant_id)!;
+    if (p.status === 'confirmed') {
+      f.totalPaid = round2(f.totalPaid + p.amount);
+      f.advanceCredit = round2(f.advanceCredit + p.amount - (allocated.get(p._id) ?? 0));
+    } else {
+      f.pendingConfirmation = round2(f.pendingConfirmation + p.amount);
+    }
   }
 
-  const deposits = await q('deposit_transactions')
-    .where('account_id', accountId)
-    .whereIn('tenant_id', tenantIds)
-    .select('tenant_id')
-    .select(q.raw(`SUM(CASE WHEN type = 'received' THEN amount ELSE -amount END) AS held`))
-    .groupBy('tenant_id');
-  for (const r of deposits as any[]) {
-    result.get(r.tenant_id)!.depositHeld = Number(r.held);
-  }
+  for (const r of deposits) result.get(r._id)!.depositHeld = round2(r.held);
 
   for (const f of result.values()) {
-    f.netBalance = Math.round((f.totalCharged - f.totalPaid) * 100) / 100;
+    f.netBalance = round2(f.totalCharged - f.totalPaid);
   }
   return result;
 }
 
 /** Security deposit currently held for each agreement. */
-export async function depositHeldByAgreement(q: Q, agreementIds: string[]): Promise<Map<string, number>> {
+export async function depositHeldByAgreement(agreementIds: string[], session?: Session): Promise<Map<string, number>> {
   if (agreementIds.length === 0) return new Map();
-  const rows = await q('deposit_transactions')
-    .whereIn('agreement_id', agreementIds)
-    .select('agreement_id')
-    .select(q.raw(`SUM(CASE WHEN type = 'received' THEN amount ELSE -amount END) AS held`))
-    .groupBy('agreement_id');
-  return new Map(rows.map((r: any) => [r.agreement_id, Number(r.held)]));
+  const rows = await col('deposit_transactions')
+    .aggregate(
+      [
+        { $match: { agreement_id: { $in: agreementIds } } },
+        { $group: { _id: '$agreement_id', held: { $sum: { $cond: [{ $eq: ['$type', 'received'] }, '$amount', { $multiply: ['$amount', -1] }] } } } },
+      ],
+      sessionOpt(session),
+    )
+    .toArray();
+  return new Map(rows.map((r) => [r._id as string, round2(r.held)]));
 }

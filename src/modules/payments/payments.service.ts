@@ -1,9 +1,10 @@
-import { db, type Trx } from '../../db/knex.js';
+import type { ClientSession, Document } from 'mongodb';
+import { $round2, col, contains, newId, withTransaction } from '../../db/mongo.js';
 import type { Ctx } from '../../lib/context.js';
 import { humanDate } from '../../lib/dates.js';
 import { Errors } from '../../lib/errors.js';
 import { formatInr, round2 } from '../../lib/money.js';
-import { likePattern, resolveSort } from '../../lib/validation.js';
+import { resolveSort } from '../../lib/validation.js';
 import { logActivity } from '../activity/activity.service.js';
 import { notifyAccountMembers, notifyTenant } from '../notifications/notifications.service.js';
 import { periodLabelFor } from '../rents/charge-query.js';
@@ -62,25 +63,36 @@ export interface PaymentDetailDto extends PaymentDto {
   targetCharge: { id: string; periodLabel: string; unitName: string; dueDate: string; totalAmount: number } | null;
 }
 
-function paymentQuery(q: typeof db | Trx, accountId: string) {
-  const allocated = q('payment_allocations').select('payment_id').sum({ allocated: 'amount' }).where('account_id', accountId).groupBy('payment_id');
-  return q('payments as pm')
-    .join('tenants as t', 't.id', 'pm.tenant_id')
-    .leftJoin('units as u', 'u.id', 'pm.unit_id')
-    .leftJoin('properties as p', 'p.id', 'u.property_id')
-    .leftJoin('users as rb', 'rb.id', 'pm.recorded_by')
-    .leftJoin(allocated.as('al'), 'al.payment_id', 'pm.id')
-    .where('pm.account_id', accountId)
-    .select(
-      'pm.*',
-      't.name as tenant_name',
-      't.phone as tenant_phone',
-      'u.name as unit_name',
-      'p.id as property_id',
-      'p.name as property_name',
-      'rb.name as recorded_by_name',
-      q.raw('COALESCE(al.allocated, 0) AS allocated_amount'),
-    );
+/** Stages adding tenant/unit/property/recorder names and the allocated total to payment documents. */
+function paymentRefStages(): Document[] {
+  return [
+    { $lookup: { from: 'tenants', localField: 'tenant_id', foreignField: '_id', pipeline: [{ $project: { name: 1, phone: 1 } }], as: '_t' } },
+    { $lookup: { from: 'units', localField: 'unit_id', foreignField: '_id', pipeline: [{ $project: { name: 1, property_id: 1 } }], as: '_u' } },
+    { $addFields: { _t: { $first: '$_t' }, _u: { $first: '$_u' } } },
+    { $lookup: { from: 'properties', localField: '_u.property_id', foreignField: '_id', pipeline: [{ $project: { name: 1 } }], as: '_p' } },
+    { $lookup: { from: 'users', localField: 'recorded_by', foreignField: '_id', pipeline: [{ $project: { name: 1 } }], as: '_rb' } },
+    { $lookup: { from: 'payment_allocations', localField: '_id', foreignField: 'payment_id', pipeline: [{ $project: { amount: 1 } }], as: '_al' } },
+    {
+      $addFields: {
+        id: '$_id',
+        tenant_name: '$_t.name',
+        tenant_phone: '$_t.phone',
+        unit_name: '$_u.name',
+        property_id: { $first: '$_p._id' },
+        property_name: { $first: '$_p.name' },
+        recorded_by_name: { $first: '$_rb.name' },
+        allocated_amount: $round2({ $sum: '$_al.amount' }),
+      },
+    },
+    { $project: { _t: 0, _u: 0, _p: 0, _rb: 0, _al: 0, lock_version: 0 } },
+  ];
+}
+
+async function findPaymentRow(accountId: string, id: string): Promise<Record<string, any> | undefined> {
+  const [row] = await col('payments')
+    .aggregate([{ $match: { _id: id, account_id: accountId } }, ...paymentRefStages()])
+    .toArray();
+  return row;
 }
 
 function mapPayment(r: Record<string, any>): PaymentDto {
@@ -132,59 +144,81 @@ export async function listPayments(
 ): Promise<{ items: PaymentDto[]; total: number; summary: { count: number; amount: number } }> {
   const sort = resolveSort(
     opts.sort,
-    { paidOn: 'pm.paid_on', amount: 'pm.amount', createdAt: 'pm.created_at', tenant: 'lower(t.name)' },
-    { column: 'pm.paid_on', direction: 'desc' },
+    { paidOn: 'paid_on', amount: 'amount', createdAt: 'created_at', tenant: '_tenant_lc' },
+    { column: 'paid_on', direction: 'desc' },
   );
-  const base = paymentQuery(db, ctx.accountId).modify((q) => {
-    if (opts.tenantId) q.where('pm.tenant_id', opts.tenantId);
-    if (opts.agreementId) q.where('pm.agreement_id', opts.agreementId);
-    if (opts.unitId) q.where('pm.unit_id', opts.unitId);
-    if (opts.propertyId) q.where('p.id', opts.propertyId);
-    if (opts.method) q.where('pm.method', opts.method);
-    if (opts.status) q.where('pm.status', opts.status);
-    if (opts.source) q.where('pm.source', opts.source);
-    if (opts.from) q.where('pm.paid_on', '>=', opts.from);
-    if (opts.to) q.where('pm.paid_on', '<=', opts.to);
-    if (opts.search) {
-      const pattern = likePattern(opts.search);
-      q.where((w) =>
-        w.whereILike('t.name', pattern).orWhereILike('pm.reference', pattern).orWhereILike('u.name', pattern).orWhereILike('pm.notes', pattern),
-      );
-    }
-  });
+  const match: Document = { account_id: ctx.accountId };
+  if (opts.tenantId) match.tenant_id = opts.tenantId;
+  if (opts.agreementId) match.agreement_id = opts.agreementId;
+  if (opts.unitId) match.unit_id = opts.unitId;
+  if (opts.method) match.method = opts.method;
+  if (opts.status) match.status = opts.status;
+  if (opts.source) match.source = opts.source;
+  if (opts.from || opts.to) match.paid_on = { ...(opts.from ? { $gte: opts.from } : {}), ...(opts.to ? { $lte: opts.to } : {}) };
 
-  const [agg] = await db.from(base.clone().as('x')).select(db.raw('COUNT(*) AS count'), db.raw('COALESCE(SUM(x.amount), 0) AS amount'));
-  const rows = await base
-    .orderByRaw(`${sort.column} ${sort.direction}, pm.created_at DESC, pm.id`)
-    .limit(opts.pageSize)
-    .offset((opts.page - 1) * opts.pageSize);
+  const pipeline: Document[] = [{ $match: match }, ...paymentRefStages()];
+  if (opts.propertyId) pipeline.push({ $match: { property_id: opts.propertyId } });
+  if (opts.search) {
+    const pattern = contains(opts.search);
+    pipeline.push({ $match: { $or: [{ tenant_name: pattern }, { reference: pattern }, { unit_name: pattern }, { notes: pattern }] } });
+  }
+  pipeline.push({ $addFields: { _tenant_lc: { $toLower: { $ifNull: ['$tenant_name', ''] } } } });
+
+  const [result] = await col('payments')
+    .aggregate([
+      ...pipeline,
+      {
+        $facet: {
+          agg: [{ $group: { _id: null, count: { $sum: 1 }, amount: { $sum: '$amount' } } }],
+          rows: [
+            { $sort: { [sort.column]: sort.direction === 'asc' ? 1 : -1, created_at: -1, _id: 1 } },
+            { $skip: (opts.page - 1) * opts.pageSize },
+            { $limit: opts.pageSize },
+          ],
+        },
+      },
+    ])
+    .toArray();
+  const count = result.agg[0]?.count ?? 0;
   return {
-    items: rows.map(mapPayment),
-    total: Number(agg.count),
-    summary: { count: Number(agg.count), amount: Number(agg.amount) },
+    items: result.rows.map(mapPayment),
+    total: count,
+    summary: { count, amount: round2(result.agg[0]?.amount ?? 0) },
   };
 }
 
 export async function getPayment(ctx: Ctx, id: string): Promise<PaymentDetailDto> {
-  const row = await paymentQuery(db, ctx.accountId).where('pm.id', id).first();
+  const row = await findPaymentRow(ctx.accountId, id);
   if (!row) throw Errors.notFound('Payment');
-  const allocations = await db('payment_allocations as pa')
-    .join('rent_charges as c', 'c.id', 'pa.charge_id')
-    .join('units as u', 'u.id', 'c.unit_id')
-    .where('pa.payment_id', id)
-    .orderBy('c.due_date')
-    .select('pa.charge_id', 'pa.amount', 'c.kind', 'c.period_start', 'c.period_end', 'c.due_date', 'u.name as unit_name');
+  const allocations = await col('payment_allocations')
+    .aggregate([
+      { $match: { payment_id: id } },
+      { $lookup: { from: 'rent_charges', localField: 'charge_id', foreignField: '_id', as: 'c' } },
+      { $unwind: '$c' },
+      { $lookup: { from: 'units', localField: 'c.unit_id', foreignField: '_id', pipeline: [{ $project: { name: 1 } }], as: 'u' } },
+      { $sort: { 'c.due_date': 1 } },
+      {
+        $project: {
+          charge_id: 1,
+          amount: 1,
+          kind: '$c.kind',
+          period_start: '$c.period_start',
+          period_end: '$c.period_end',
+          due_date: '$c.due_date',
+          unit_name: { $first: '$u.name' },
+        },
+      },
+    ])
+    .toArray();
   let targetCharge: PaymentDetailDto['targetCharge'] = null;
   if (row.target_charge_id) {
-    const c = await db('rent_charges as c')
-      .join('units as u', 'u.id', 'c.unit_id')
-      .where('c.id', row.target_charge_id)
-      .first('c.id', 'c.kind', 'c.period_start', 'c.period_end', 'c.due_date', 'c.total_amount', 'u.name as unit_name');
+    const c = await col('rent_charges').findOne({ _id: row.target_charge_id });
     if (c) {
+      const unit = await col('units').findOne({ _id: c.unit_id }, { projection: { name: 1 } });
       targetCharge = {
-        id: c.id,
+        id: c._id,
         periodLabel: periodLabelFor(c.kind, c.period_start, c.period_end),
-        unitName: c.unit_name,
+        unitName: unit?.name,
         dueDate: c.due_date,
         totalAmount: Number(c.total_amount),
       };
@@ -205,43 +239,37 @@ export async function getPayment(ctx: Ctx, id: string): Promise<PaymentDetailDto
 }
 
 async function resolveLinks(
-  trx: Trx,
+  session: ClientSession,
   ctx: Ctx,
   input: { tenantId: string; agreementId?: string | null; targetChargeId?: string | null },
 ): Promise<{ tenant: { id: string; name: string }; agreementId: string | null; unitId: string | null; unitName: string | null }> {
-  const tenant = await trx('tenants').where({ id: input.tenantId, account_id: ctx.accountId }).first('id', 'name');
-  if (!tenant) throw Errors.validation('Tenant not found.', [{ field: 'tenantId', message: 'Tenant not found' }]);
+  const tenantDoc = await col('tenants').findOne({ _id: input.tenantId, account_id: ctx.accountId }, { session });
+  if (!tenantDoc) throw Errors.validation('Tenant not found.', [{ field: 'tenantId', message: 'Tenant not found' }]);
+  const tenant = { id: tenantDoc._id, name: tenantDoc.name as string };
+  const unitName = async (unitId: string) => ((await col('units').findOne({ _id: unitId }, { session }))?.name as string) ?? null;
 
   if (input.targetChargeId) {
-    const charge = await trx('rent_charges as c')
-      .join('units as u', 'u.id', 'c.unit_id')
-      .where({ 'c.id': input.targetChargeId, 'c.account_id': ctx.accountId })
-      .first('c.tenant_id', 'c.agreement_id', 'c.unit_id', 'c.voided_at', 'u.name as unit_name');
+    const charge = await col('rent_charges').findOne({ _id: input.targetChargeId, account_id: ctx.accountId }, { session });
     if (!charge || charge.tenant_id !== tenant.id) {
       throw Errors.validation('Rent entry not found for this tenant.', [{ field: 'targetChargeId', message: 'Invalid rent entry' }]);
     }
     if (charge.voided_at) throw Errors.conflict('This rent entry has been cancelled.');
-    return { tenant, agreementId: charge.agreement_id, unitId: charge.unit_id, unitName: charge.unit_name };
+    return { tenant, agreementId: charge.agreement_id, unitId: charge.unit_id, unitName: await unitName(charge.unit_id) };
   }
 
   if (input.agreementId) {
-    const agreement = await trx('agreements as a')
-      .join('units as u', 'u.id', 'a.unit_id')
-      .where({ 'a.id': input.agreementId, 'a.account_id': ctx.accountId })
-      .first('a.tenant_id', 'a.unit_id', 'u.name as unit_name');
+    const agreement = await col('agreements').findOne({ _id: input.agreementId, account_id: ctx.accountId }, { session });
     if (!agreement || agreement.tenant_id !== tenant.id) {
       throw Errors.validation('Agreement not found for this tenant.', [{ field: 'agreementId', message: 'Invalid agreement' }]);
     }
-    return { tenant, agreementId: input.agreementId, unitId: agreement.unit_id, unitName: agreement.unit_name };
+    return { tenant, agreementId: input.agreementId, unitId: agreement.unit_id, unitName: await unitName(agreement.unit_id) };
   }
 
-  const agreements = await trx('agreements as a')
-    .join('units as u', 'u.id', 'a.unit_id')
-    .where({ 'a.tenant_id': tenant.id })
-    .where((q) => q.where('a.status', 'active').orWhere('a.ended_on', '>=', ctx.today))
-    .select('a.id', 'a.unit_id', 'u.name as unit_name');
+  const agreements = await col('agreements')
+    .find({ tenant_id: tenant.id, $or: [{ status: 'active' }, { ended_on: { $gte: ctx.today } }] }, { session })
+    .toArray();
   if (agreements.length === 1) {
-    return { tenant, agreementId: agreements[0].id, unitId: agreements[0].unit_id, unitName: agreements[0].unit_name };
+    return { tenant, agreementId: agreements[0]._id, unitId: agreements[0].unit_id, unitName: await unitName(agreements[0].unit_id) };
   }
   return { tenant, agreementId: null, unitId: null, unitName: null };
 }
@@ -252,10 +280,13 @@ export async function createPayment(ctx: Ctx, input: PaymentCreateInput): Promis
     throw Errors.validation('Payment date cannot be in the future.', [{ field: 'paidOn', message: 'Cannot be in the future' }]);
   }
   const status = input.status ?? 'confirmed';
-  const id = await db.transaction(async (trx) => {
-    const links = await resolveLinks(trx, ctx, input);
-    const [row] = await trx('payments')
-      .insert({
+  const id = await withTransaction(async (session) => {
+    const links = await resolveLinks(session, ctx, input);
+    const paymentId = newId();
+    const now = new Date();
+    await col('payments').insertOne(
+      {
+        _id: paymentId,
         account_id: ctx.accountId,
         tenant_id: input.tenantId,
         agreement_id: links.agreementId,
@@ -270,47 +301,58 @@ export async function createPayment(ctx: Ctx, input: PaymentCreateInput): Promis
         source: 'owner',
         recorded_by: ctx.userId,
         confirmed_by: status === 'confirmed' ? ctx.userId : null,
-        confirmed_at: status === 'confirmed' ? new Date() : null,
-      })
-      .returning('id');
+        confirmed_at: status === 'confirmed' ? now : null,
+        rejected_reason: null,
+        voided_at: null,
+        void_reason: null,
+        created_at: now,
+        updated_at: now,
+      },
+      { session },
+    );
 
-    if (status === 'confirmed') await allocateTenant(trx, ctx.accountId, input.tenantId);
+    if (status === 'confirmed') await allocateTenant(session, ctx.accountId, input.tenantId);
 
     const where = links.unitName ? ` for ${links.unitName}` : '';
     const summary =
       status === 'confirmed'
         ? `Recorded ${formatInr(input.amount)} from ${links.tenant.name}${where} (${METHOD_LABELS[input.method]})`
         : `Recorded ${formatInr(input.amount)} ${METHOD_LABELS[input.method].toLowerCase()} from ${links.tenant.name}${where} — awaiting clearance`;
-    await logActivity(trx, ctx, { action: 'payment.recorded', entityType: 'payment', entityId: row.id, summary });
+    await logActivity(session, ctx, { action: 'payment.recorded', entityType: 'payment', entityId: paymentId, summary });
 
     if (status === 'confirmed') {
-      await notifyTenant(trx, input.tenantId, {
+      await notifyTenant(session, input.tenantId, {
         type: 'payment_confirmed',
         title: `Payment of ${formatInr(input.amount)} received`,
         body: `Your landlord recorded your payment of ${formatInr(input.amount)} on ${humanDate(input.paidOn)}${where}.`,
         entityType: 'payment',
-        entityId: row.id,
+        entityId: paymentId,
       });
     }
     await notifyAccountMembers(
-      trx,
+      session,
       ctx.accountId,
       {
         type: 'payment_recorded',
         title: `${formatInr(input.amount)} received from ${links.tenant.name}`,
         body: `${ctx.userName ?? 'A partner'} recorded a ${METHOD_LABELS[input.method]} payment${where}.`,
         entityType: 'payment',
-        entityId: row.id,
+        entityId: paymentId,
       },
       { excludeUserId: ctx.userId },
     );
-    return row.id as string;
+    return paymentId;
   });
   return getPayment(ctx, id);
 }
 
-async function lockPayment(trx: Trx, ctx: Ctx, id: string) {
-  const row = await trx('payments').where({ id, account_id: ctx.accountId }).forUpdate().first();
+/** Loads a payment for a change and locks it for the rest of the transaction. */
+async function lockPayment(session: ClientSession, ctx: Ctx, id: string) {
+  const row = await col('payments').findOneAndUpdate(
+    { _id: id, account_id: ctx.accountId },
+    { $inc: { lock_version: 1 } },
+    { session, returnDocument: 'before' },
+  );
   if (!row) throw Errors.notFound('Payment');
   return row;
 }
@@ -323,8 +365,8 @@ export async function updatePayment(
   if (input.paidOn && input.paidOn > ctx.today) {
     throw Errors.validation('Payment date cannot be in the future.', [{ field: 'paidOn', message: 'Cannot be in the future' }]);
   }
-  await db.transaction(async (trx) => {
-    const payment = await lockPayment(trx, ctx, id);
+  await withTransaction(async (session) => {
+    const payment = await lockPayment(session, ctx, id);
     if (payment.status === 'void' || payment.status === 'rejected') throw Errors.conflict('Voided or rejected payments cannot be edited.');
     if (payment.method === 'deposit') throw Errors.conflict('Deposit adjustments are managed from the agreement’s deposit section.');
 
@@ -337,11 +379,11 @@ export async function updatePayment(
     if (!Object.keys(changes).length) return;
 
     const amountChanged = input.amount !== undefined && input.amount !== Number(payment.amount);
-    if (amountChanged && payment.status === 'confirmed') await clearPaymentAllocations(trx, id);
-    await trx('payments').where({ id }).update(changes);
-    if (amountChanged && payment.status === 'confirmed') await allocateTenant(trx, ctx.accountId, payment.tenant_id);
+    if (amountChanged && payment.status === 'confirmed') await clearPaymentAllocations(session, id);
+    await col('payments').updateOne({ _id: id }, { $set: { ...changes, updated_at: new Date() } }, { session });
+    if (amountChanged && payment.status === 'confirmed') await allocateTenant(session, ctx.accountId, payment.tenant_id);
 
-    await logActivity(trx, ctx, {
+    await logActivity(session, ctx, {
       action: 'payment.updated',
       entityType: 'payment',
       entityId: id,
@@ -354,19 +396,23 @@ export async function updatePayment(
 }
 
 export async function confirmPayment(ctx: Ctx, id: string): Promise<PaymentDetailDto> {
-  await db.transaction(async (trx) => {
-    const payment = await lockPayment(trx, ctx, id);
+  await withTransaction(async (session) => {
+    const payment = await lockPayment(session, ctx, id);
     if (payment.status !== 'pending') throw Errors.conflict('Only payments awaiting confirmation can be confirmed.');
-    await trx('payments').where({ id }).update({ status: 'confirmed', confirmed_by: ctx.userId, confirmed_at: new Date() });
-    await allocateTenant(trx, ctx.accountId, payment.tenant_id);
-    const tenant = await trx('tenants').where({ id: payment.tenant_id }).first('name');
-    await logActivity(trx, ctx, {
+    await col('payments').updateOne(
+      { _id: id },
+      { $set: { status: 'confirmed', confirmed_by: ctx.userId, confirmed_at: new Date(), updated_at: new Date() } },
+      { session },
+    );
+    await allocateTenant(session, ctx.accountId, payment.tenant_id);
+    const tenant = await col('tenants').findOne({ _id: payment.tenant_id }, { session });
+    await logActivity(session, ctx, {
       action: 'payment.confirmed',
       entityType: 'payment',
       entityId: id,
       summary: `Confirmed ${formatInr(Number(payment.amount))} from ${tenant?.name} (${METHOD_LABELS[payment.method as PaymentMethod]})`,
     });
-    await notifyTenant(trx, payment.tenant_id, {
+    await notifyTenant(session, payment.tenant_id, {
       type: 'payment_confirmed',
       title: 'Payment confirmed',
       body: `Your payment of ${formatInr(Number(payment.amount))} made on ${humanDate(payment.paid_on)} has been confirmed.`,
@@ -378,18 +424,18 @@ export async function confirmPayment(ctx: Ctx, id: string): Promise<PaymentDetai
 }
 
 export async function rejectPayment(ctx: Ctx, id: string, reason: string): Promise<PaymentDetailDto> {
-  await db.transaction(async (trx) => {
-    const payment = await lockPayment(trx, ctx, id);
+  await withTransaction(async (session) => {
+    const payment = await lockPayment(session, ctx, id);
     if (payment.status !== 'pending') throw Errors.conflict('Only payments awaiting confirmation can be rejected.');
-    await trx('payments').where({ id }).update({ status: 'rejected', rejected_reason: reason });
-    const tenant = await trx('tenants').where({ id: payment.tenant_id }).first('name');
-    await logActivity(trx, ctx, {
+    await col('payments').updateOne({ _id: id }, { $set: { status: 'rejected', rejected_reason: reason, updated_at: new Date() } }, { session });
+    const tenant = await col('tenants').findOne({ _id: payment.tenant_id }, { session });
+    await logActivity(session, ctx, {
       action: 'payment.rejected',
       entityType: 'payment',
       entityId: id,
       summary: `Rejected ${formatInr(Number(payment.amount))} submitted by ${tenant?.name}: ${reason}`,
     });
-    await notifyTenant(trx, payment.tenant_id, {
+    await notifyTenant(session, payment.tenant_id, {
       type: 'payment_rejected',
       title: 'Payment not confirmed',
       body: `Your landlord could not confirm your payment of ${formatInr(Number(payment.amount))}: ${reason}`,
@@ -401,19 +447,23 @@ export async function rejectPayment(ctx: Ctx, id: string, reason: string): Promi
 }
 
 export async function voidPayment(ctx: Ctx, id: string, reason: string): Promise<PaymentDetailDto> {
-  await db.transaction(async (trx) => {
-    const payment = await lockPayment(trx, ctx, id);
+  await withTransaction(async (session) => {
+    const payment = await lockPayment(session, ctx, id);
     if (payment.status === 'void') throw Errors.conflict('This payment is already void.');
     if (payment.status === 'rejected') throw Errors.conflict('Rejected payments cannot be voided.');
-    await clearPaymentAllocations(trx, id);
-    await trx('payments').where({ id }).update({ status: 'void', voided_at: new Date(), void_reason: reason });
+    await clearPaymentAllocations(session, id);
+    await col('payments').updateOne(
+      { _id: id },
+      { $set: { status: 'void', voided_at: new Date(), void_reason: reason, updated_at: new Date() } },
+      { session },
+    );
     if (payment.method === 'deposit') {
       // Undo the deposit adjustment so the money counts as deposit held again.
-      await trx('deposit_transactions').where({ payment_id: id }).delete();
+      await col('deposit_transactions').deleteMany({ payment_id: id }, { session });
     }
-    await allocateTenant(trx, ctx.accountId, payment.tenant_id);
-    const tenant = await trx('tenants').where({ id: payment.tenant_id }).first('name');
-    await logActivity(trx, ctx, {
+    await allocateTenant(session, ctx.accountId, payment.tenant_id);
+    const tenant = await col('tenants').findOne({ _id: payment.tenant_id }, { session });
+    await logActivity(session, ctx, {
       action: 'payment.voided',
       entityType: 'payment',
       entityId: id,

@@ -1,4 +1,4 @@
-# Production-like stack for the API: PostgreSQL + RentOLedger API.
+# Production-like stack for the API: MongoDB (single-node replica set) + RentOLedger API.
 #
 #   export JWT_ACCESS_SECRET=$(openssl rand -hex 32) OTP_SECRET=$(openssl rand -hex 32)
 #   docker compose up --build -d
@@ -9,31 +9,39 @@
 #
 # SMS: codes are written to the API log (`docker compose logs api`) until you set
 # SMS_PROVIDER=twilio with TWILIO_* credentials and ALLOW_CONSOLE_SMS_IN_PRODUCTION=false.
+#
+# For a managed database, remove the `mongo` service and set MONGODB_URI to your
+# MongoDB Atlas connection string.
 
 services:
-  db:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: rentoledger
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rentoledger}
-      POSTGRES_DB: rentoledger
+  mongo:
+    image: mongo:7
+    # Transactions need a replica set; a single member is enough.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mongodata:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rentoledger -d rentoledger"]
+      # Initialises the replica set on first start, then reports healthy once it has a primary.
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "try { rs.status().ok } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }).ok }"
       interval: 5s
-      timeout: 5s
-      retries: 20
+      timeout: 10s
+      retries: 30
+      start_period: 10s
     restart: unless-stopped
 
   api:
     build: .
     depends_on:
-      db:
+      mongo:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://rentoledger:${POSTGRES_PASSWORD:-rentoledger}@db:5432/rentoledger
-      DB_AUTO_MIGRATE: "true"
+      MONGODB_URI: mongodb://mongo:27017/?replicaSet=rs0
+      MONGODB_DB: rentoledger
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Set JWT_ACCESS_SECRET, e.g. export JWT_ACCESS_SECRET=$$(openssl rand -hex 32)}
       OTP_SECRET: ${OTP_SECRET:?Set OTP_SECRET, e.g. export OTP_SECRET=$$(openssl rand -hex 32)}
       SMS_PROVIDER: ${SMS_PROVIDER:-console}
@@ -49,4 +57,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  pgdata:
+  mongodata:

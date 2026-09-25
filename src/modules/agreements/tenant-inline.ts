@@ -1,7 +1,9 @@
-import type { Trx } from '../../db/knex.js';
+import type { ClientSession } from 'mongodb';
+import { col } from '../../db/mongo.js';
 import type { Ctx } from '../../lib/context.js';
 import { Errors } from '../../lib/errors.js';
 import { logActivity } from '../activity/activity.service.js';
+import { newTenantDoc } from '../tenants/tenants.service.js';
 
 export interface NewTenantInput {
   name: string;
@@ -14,28 +16,23 @@ export interface NewTenantInput {
 }
 
 /** Creates a tenant as part of the "rent out a unit" flow (same transaction as the agreement). */
-export async function createTenantInTrx(trx: Trx, ctx: Ctx, input: NewTenantInput): Promise<{ id: string; name: string }> {
-  const existing = await trx('tenants')
-    .where({ account_id: ctx.accountId, phone: input.phone })
-    .whereNull('archived_at')
-    .first('id', 'name');
+export async function createTenantInTrx(session: ClientSession, ctx: Ctx, input: NewTenantInput): Promise<{ id: string; name: string }> {
+  const existing = await col('tenants').findOne({ account_id: ctx.accountId, phone: input.phone, archived_at: null }, { session });
   if (existing) {
     throw Errors.conflict(`${existing.name} is already a tenant with this mobile number. Select the existing tenant instead.`, [
       { field: 'newTenant.phone', message: 'Already exists' },
     ]);
   }
-  const [row] = await trx('tenants')
-    .insert({
-      account_id: ctx.accountId,
-      name: input.name,
-      phone: input.phone,
-      email: input.email ?? null,
-      business_name: input.businessName ?? null,
-      gstin: input.gstin ?? null,
-      address: input.address ?? null,
-      portal_enabled: input.portalEnabled ?? true,
-    })
-    .returning(['id', 'name']);
-  await logActivity(trx, ctx, { action: 'tenant.created', entityType: 'tenant', entityId: row.id, summary: `Added tenant ${row.name}` });
-  return row;
+  const doc = newTenantDoc(ctx.accountId, {
+    name: input.name,
+    phone: input.phone,
+    email: input.email ?? null,
+    businessName: input.businessName ?? null,
+    gstin: input.gstin ?? null,
+    address: input.address ?? null,
+    portalEnabled: input.portalEnabled ?? true,
+  });
+  await col('tenants').insertOne(doc, { session });
+  await logActivity(session, ctx, { action: 'tenant.created', entityType: 'tenant', entityId: doc._id, summary: `Added tenant ${doc.name}` });
+  return { id: doc._id, name: doc.name };
 }

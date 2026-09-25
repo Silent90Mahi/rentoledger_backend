@@ -1,11 +1,10 @@
 import { logger } from '../config/logger.js';
-import { db } from '../db/knex.js';
+import { col } from '../db/mongo.js';
 import { now, todayIn } from '../lib/clock.js';
 import { addDays, humanDate } from '../lib/dates.js';
 import { formatInr } from '../lib/money.js';
 import { notifyAccountMembers, notifyTenant } from '../modules/notifications/notifications.service.js';
-import { chargeQuery } from '../modules/rents/charge-query.js';
-import { periodLabelFor } from '../modules/rents/charge-query.js';
+import { chargeRefStages, chargeStatusStages, periodLabelFor } from '../modules/rents/charge-query.js';
 
 export interface ReminderReport {
   accounts: number;
@@ -23,20 +22,27 @@ export interface ReminderReport {
  */
 export async function runReminderTasks(): Promise<ReminderReport> {
   const report: ReminderReport = { accounts: 0, overdue: 0, dueSoon: 0, expiring: 0 };
-  const accounts = await db('accounts').select('id', 'timezone', 'reminder_days_before');
+  const accounts = (await col('accounts').find({}, { projection: { timezone: 1, reminder_days_before: 1 } }).toArray()).map((a) => ({
+    id: a._id,
+    timezone: a.timezone as string,
+    reminder_days_before: (a.reminder_days_before as number) ?? 3,
+  }));
 
   for (const account of accounts) {
     report.accounts += 1;
     const today = todayIn(account.timezone);
     try {
-      const overdue = await db
-        .from(chargeQuery(db, { accountId: account.id }, today).as('x'))
-        .where('x.status', 'overdue')
-        .select('x.id', 'x.tenant_id', 'x.tenant_name', 'x.unit_name', 'x.kind', 'x.period_start', 'x.period_end', 'x.due_date', 'x.balance');
+      const overdue = await col('rent_charges')
+        .aggregate([
+          ...chargeStatusStages({ accountId: account.id }, today, { voided_at: null, due_date: { $lt: today } }),
+          { $match: { status: 'overdue' } },
+          ...chargeRefStages(),
+        ])
+        .toArray();
       for (const c of overdue) {
         const period = periodLabelFor(c.kind, c.period_start, c.period_end);
         report.overdue += await notifyAccountMembers(
-          db,
+          undefined,
           account.id,
           {
             type: 'rent_overdue',
@@ -48,7 +54,7 @@ export async function runReminderTasks(): Promise<ReminderReport> {
           },
           { lateRentOnly: true },
         );
-        await notifyTenant(db, c.tenant_id, {
+        await notifyTenant(undefined, c.tenant_id, {
           type: 'rent_overdue',
           title: 'Your rent is overdue',
           body: `${formatInr(Number(c.balance))} for ${c.unit_name} (${period}) was due on ${humanDate(c.due_date)}.`,
@@ -59,12 +65,15 @@ export async function runReminderTasks(): Promise<ReminderReport> {
       }
 
       const horizon = addDays(today, account.reminder_days_before);
-      const dueSoon = await db
-        .from(chargeQuery(db, { accountId: account.id }, today).whereBetween('c.due_date', [today, horizon]).as('x'))
-        .where('x.status', 'pending')
-        .select('x.id', 'x.tenant_id', 'x.unit_name', 'x.kind', 'x.period_start', 'x.period_end', 'x.due_date', 'x.balance');
+      const dueSoon = await col('rent_charges')
+        .aggregate([
+          ...chargeStatusStages({ accountId: account.id }, today, { voided_at: null, due_date: { $gte: today, $lte: horizon } }),
+          { $match: { status: 'pending' } },
+          ...chargeRefStages(),
+        ])
+        .toArray();
       for (const c of dueSoon) {
-        report.dueSoon += await notifyTenant(db, c.tenant_id, {
+        report.dueSoon += await notifyTenant(undefined, c.tenant_id, {
           type: 'rent_due_soon',
           title: c.due_date === today ? 'Rent due today' : `Rent due on ${humanDate(c.due_date)}`,
           body: `${formatInr(Number(c.balance))} for ${c.unit_name} (${periodLabelFor(c.kind, c.period_start, c.period_end)}).`,
@@ -74,15 +83,14 @@ export async function runReminderTasks(): Promise<ReminderReport> {
         }, { reminder: true });
       }
 
-      const expiring = await db('agreements as a')
-        .join('units as u', 'u.id', 'a.unit_id')
-        .join('tenants as t', 't.id', 'a.tenant_id')
-        .where({ 'a.account_id': account.id, 'a.status': 'active' })
-        .whereNotNull('a.end_date')
-        .whereBetween('a.end_date', [today, addDays(today, 30)])
-        .select('a.id', 'a.end_date', 'u.name as unit_name', 't.name as tenant_name');
+      const expiringDocs = await col('agreements')
+        .find({ account_id: account.id, status: 'active', end_date: { $ne: null, $gte: today, $lte: addDays(today, 30) } })
+        .toArray();
+      const units = new Map((await col('units').find({ _id: { $in: expiringDocs.map((a) => a.unit_id) } }).toArray()).map((u) => [u._id, u.name]));
+      const tenants = new Map((await col('tenants').find({ _id: { $in: expiringDocs.map((a) => a.tenant_id) } }).toArray()).map((t) => [t._id, t.name]));
+      const expiring = expiringDocs.map((a) => ({ id: a._id, end_date: a.end_date, unit_name: units.get(a.unit_id), tenant_name: tenants.get(a.tenant_id) }));
       for (const a of expiring) {
-        report.expiring += await notifyAccountMembers(db, account.id, {
+        report.expiring += await notifyAccountMembers(undefined, account.id, {
           type: 'agreement_expiring',
           title: `${a.unit_name}: agreement ends ${humanDate(a.end_date)}`,
           body: `The agreement with ${a.tenant_name} ends soon. Renew it or plan the move-out.`,
@@ -102,9 +110,7 @@ export async function runReminderTasks(): Promise<ReminderReport> {
 export async function cleanupExpired(): Promise<{ otps: number; tokens: number }> {
   const dayAgo = new Date(now().getTime() - 86_400_000);
   const weekAgo = new Date(now().getTime() - 7 * 86_400_000);
-  const otps = await db('otp_codes').where('created_at', '<', dayAgo).delete();
-  const tokens = await db('refresh_tokens')
-    .where((q) => q.where('expires_at', '<', now()).orWhere('revoked_at', '<', weekAgo))
-    .delete();
+  const otps = (await col('otp_codes').deleteMany({ created_at: { $lt: dayAgo } })).deletedCount;
+  const tokens = (await col('refresh_tokens').deleteMany({ $or: [{ expires_at: { $lt: now() } }, { revoked_at: { $lt: weekAgo } }] })).deletedCount;
   return { otps, tokens };
 }

@@ -1,4 +1,5 @@
-import type { Trx } from '../../db/knex.js';
+import type { ClientSession } from 'mongodb';
+import { col, lockDoc, newId, round2, type Session } from '../../db/mongo.js';
 import { fromPaise, toPaise } from '../../lib/money.js';
 
 /**
@@ -12,43 +13,51 @@ import { fromPaise, toPaise } from '../../lib/money.js';
  * - Existing allocations are never moved, so an owner's explicit choice
  *   ("this payment was for September") is preserved.
  *
- * Must run inside a transaction; the tenant row is locked to serialise
- * concurrent allocations for the same tenant.
+ * Must run inside a transaction; the tenant document is locked so concurrent
+ * allocations for the same tenant are serialised (the loser retries).
  */
-export async function allocateTenant(trx: Trx, accountId: string, tenantId: string): Promise<void> {
-  await trx.raw('SELECT id FROM tenants WHERE id = ? AND account_id = ? FOR UPDATE', [tenantId, accountId]);
+export async function allocateTenant(session: ClientSession, accountId: string, tenantId: string): Promise<void> {
+  await lockDoc('tenants', tenantId, session);
 
-  const { rows: payments } = await trx.raw<{ rows: Array<{ id: string; target_charge_id: string | null; unallocated: number }> }>(
-    `SELECT p.id, p.target_charge_id, p.amount - COALESCE(SUM(pa.amount), 0) AS unallocated
-       FROM payments p
-       LEFT JOIN payment_allocations pa ON pa.payment_id = p.id
-      WHERE p.account_id = ? AND p.tenant_id = ? AND p.status = 'confirmed'
-      GROUP BY p.id
-     HAVING p.amount - COALESCE(SUM(pa.amount), 0) > 0
-      ORDER BY p.paid_on, p.created_at`,
-    [accountId, tenantId],
-  );
+  const payments = await col('payments')
+    .find({ account_id: accountId, tenant_id: tenantId, status: 'confirmed' }, { session })
+    .sort({ paid_on: 1, created_at: 1 })
+    .toArray();
   if (payments.length === 0) return;
 
-  const { rows: charges } = await trx.raw<{ rows: Array<{ id: string; remaining: number }> }>(
-    `SELECT c.id, c.total_amount - COALESCE(SUM(pa.amount), 0) AS remaining
-       FROM rent_charges c
-       LEFT JOIN payment_allocations pa ON pa.charge_id = c.id
-      WHERE c.account_id = ? AND c.tenant_id = ? AND c.voided_at IS NULL
-      GROUP BY c.id
-     HAVING c.total_amount - COALESCE(SUM(pa.amount), 0) > 0
-      ORDER BY c.due_date, c.period_start, c.created_at`,
-    [accountId, tenantId],
-  );
+  const charges = await col('rent_charges')
+    .find({ account_id: accountId, tenant_id: tenantId, voided_at: null }, { session })
+    .sort({ due_date: 1, period_start: 1, created_at: 1 })
+    .toArray();
   if (charges.length === 0) return;
 
-  const remaining = new Map<string, number>(charges.map((c) => [c.id, toPaise(Number(c.remaining))]));
-  const fifo = charges.map((c) => c.id);
-  const planned = new Map<string, { paymentId: string; chargeId: string; paise: number }>();
+  const allocations = await col('payment_allocations')
+    .find({ account_id: accountId, $or: [{ payment_id: { $in: payments.map((p) => p._id) } }, { charge_id: { $in: charges.map((c) => c._id) } }] }, { session })
+    .toArray();
 
+  const allocatedByPayment = new Map<string, number>();
+  const allocatedByCharge = new Map<string, number>();
+  const existing = new Map<string, { id: string; paise: number }>();
+  for (const a of allocations) {
+    const paise = toPaise(a.amount);
+    allocatedByPayment.set(a.payment_id, (allocatedByPayment.get(a.payment_id) ?? 0) + paise);
+    allocatedByCharge.set(a.charge_id, (allocatedByCharge.get(a.charge_id) ?? 0) + paise);
+    existing.set(`${a.payment_id}:${a.charge_id}`, { id: a._id, paise });
+  }
+
+  const remaining = new Map<string, number>();
+  for (const c of charges) {
+    const open = toPaise(c.total_amount) - (allocatedByCharge.get(c._id) ?? 0);
+    if (open > 0) remaining.set(c._id, open);
+  }
+  if (remaining.size === 0) return;
+  const fifo = charges.map((c) => c._id).filter((id) => remaining.has(id));
+
+  const planned = new Map<string, { paymentId: string; chargeId: string; paise: number }>();
   for (const payment of payments) {
-    let credit = toPaise(Number(payment.unallocated));
-    const target = payment.target_charge_id;
+    let credit = toPaise(payment.amount) - (allocatedByPayment.get(payment._id) ?? 0);
+    if (credit <= 0) continue;
+    const target = payment.target_charge_id as string | null;
     const order = target && (remaining.get(target) ?? 0) > 0 ? [target, ...fifo.filter((id) => id !== target)] : fifo;
     for (const chargeId of order) {
       if (credit <= 0) break;
@@ -57,32 +66,37 @@ export async function allocateTenant(trx: Trx, accountId: string, tenantId: stri
       const applied = Math.min(open, credit);
       remaining.set(chargeId, open - applied);
       credit -= applied;
-      const key = `${payment.id}:${chargeId}`;
-      const existing = planned.get(key);
-      planned.set(key, { paymentId: payment.id, chargeId, paise: (existing?.paise ?? 0) + applied });
+      const key = `${payment._id}:${chargeId}`;
+      const prior = planned.get(key);
+      planned.set(key, { paymentId: payment._id, chargeId, paise: (prior?.paise ?? 0) + applied });
     }
   }
-
   if (planned.size === 0) return;
-  const values = [...planned.values()];
-  const placeholders = values.map(() => '(?, ?, ?, ?)').join(', ');
-  await trx.raw(
-    `INSERT INTO payment_allocations (account_id, payment_id, charge_id, amount)
-     VALUES ${placeholders}
-     ON CONFLICT (payment_id, charge_id)
-     DO UPDATE SET amount = payment_allocations.amount + EXCLUDED.amount`,
-    values.flatMap((v) => [accountId, v.paymentId, v.chargeId, fromPaise(v.paise)]),
+
+  const now = new Date();
+  await col('payment_allocations').bulkWrite(
+    [...planned.entries()].map(([key, plan]) => {
+      const current = existing.get(key);
+      return current
+        ? { updateOne: { filter: { _id: current.id }, update: { $set: { amount: fromPaise(current.paise + plan.paise) } } } }
+        : {
+            insertOne: {
+              document: { _id: newId(), account_id: accountId, payment_id: plan.paymentId, charge_id: plan.chargeId, amount: fromPaise(plan.paise), created_at: now },
+            },
+          };
+    }),
+    { session },
   );
 }
 
 /** Removes every allocation of a payment (used when a payment is voided/rejected/edited). */
-export async function clearPaymentAllocations(trx: Trx, paymentId: string): Promise<void> {
-  await trx('payment_allocations').where({ payment_id: paymentId }).delete();
+export async function clearPaymentAllocations(session: ClientSession, paymentId: string): Promise<void> {
+  await col('payment_allocations').deleteMany({ payment_id: paymentId }, { session });
 }
 
 /** Removes every allocation made to a charge (used when a charge is voided). */
-export async function clearChargeAllocations(trx: Trx, chargeId: string): Promise<void> {
-  await trx('payment_allocations').where({ charge_id: chargeId }).delete();
+export async function clearChargeAllocations(session: ClientSession, chargeId: string): Promise<void> {
+  await col('payment_allocations').deleteMany({ charge_id: chargeId }, { session });
 }
 
 /**
@@ -90,38 +104,46 @@ export async function clearChargeAllocations(trx: Trx, chargeId: string): Promis
  * (e.g. after the amount was reduced). The most recent payments are
  * released first; released money becomes credit for the FIFO pass.
  */
-export async function trimChargeAllocations(trx: Trx, chargeId: string, newTotal: number): Promise<void> {
-  const allocations = await trx('payment_allocations as pa')
-    .join('payments as p', 'p.id', 'pa.payment_id')
-    .where('pa.charge_id', chargeId)
-    .orderBy([
-      { column: 'p.paid_on', order: 'desc' },
-      { column: 'p.created_at', order: 'desc' },
-    ])
-    .select('pa.id', 'pa.amount');
-  let excess = allocations.reduce((sum, a) => sum + toPaise(Number(a.amount)), 0) - toPaise(newTotal);
+export async function trimChargeAllocations(session: ClientSession, chargeId: string, newTotal: number): Promise<void> {
+  const allocations = await col('payment_allocations').find({ charge_id: chargeId }, { session }).toArray();
+  if (allocations.length === 0) return;
+  const payments = new Map(
+    (await col('payments').find({ _id: { $in: allocations.map((a) => a.payment_id) } }, { session, projection: { paid_on: 1, created_at: 1 } }).toArray()).map(
+      (p) => [p._id, p],
+    ),
+  );
+  // Latest payment first.
+  allocations.sort((a, b) => {
+    const pa = payments.get(a.payment_id);
+    const pb = payments.get(b.payment_id);
+    const byDate = String(pb?.paid_on ?? '').localeCompare(String(pa?.paid_on ?? ''));
+    if (byDate !== 0) return byDate;
+    return new Date(pb?.created_at ?? 0).getTime() - new Date(pa?.created_at ?? 0).getTime();
+  });
+
+  let excess = allocations.reduce((sum, a) => sum + toPaise(a.amount), 0) - toPaise(newTotal);
   for (const allocation of allocations) {
     if (excess <= 0) break;
-    const amount = toPaise(Number(allocation.amount));
+    const amount = toPaise(allocation.amount);
     if (amount <= excess) {
-      await trx('payment_allocations').where({ id: allocation.id }).delete();
+      await col('payment_allocations').deleteOne({ _id: allocation._id }, { session });
       excess -= amount;
     } else {
-      await trx('payment_allocations').where({ id: allocation.id }).update({ amount: fromPaise(amount - excess) });
+      await col('payment_allocations').updateOne({ _id: allocation._id }, { $set: { amount: fromPaise(amount - excess) } }, { session });
       excess = 0;
     }
   }
 }
 
 /** Unallocated (advance) credit of a tenant from confirmed payments. */
-export async function tenantAdvanceCredit(trx: Trx | import('knex').Knex, tenantId: string): Promise<number> {
-  const { rows } = await trx.raw<{ rows: Array<{ credit: number }> }>(
-    `SELECT COALESCE(SUM(p.amount - COALESCE(a.allocated, 0)), 0) AS credit
-       FROM payments p
-       LEFT JOIN (SELECT payment_id, SUM(amount) AS allocated FROM payment_allocations GROUP BY payment_id) a
-              ON a.payment_id = p.id
-      WHERE p.tenant_id = ? AND p.status = 'confirmed'`,
-    [tenantId],
-  );
-  return Number(rows[0]?.credit ?? 0);
+export async function tenantAdvanceCredit(tenantId: string, session?: Session): Promise<number> {
+  const payments = await col('payments')
+    .find({ tenant_id: tenantId, status: 'confirmed' }, { ...(session ? { session } : {}), projection: { amount: 1 } })
+    .toArray();
+  if (payments.length === 0) return 0;
+  const allocated = await col('payment_allocations')
+    .aggregate([{ $match: { payment_id: { $in: payments.map((p) => p._id) } } }, { $group: { _id: null, total: { $sum: '$amount' } } }], session ? { session } : {})
+    .toArray();
+  const paid = payments.reduce((sum, p) => sum + toPaise(p.amount), 0);
+  return round2(fromPaise(paid - toPaise(allocated[0]?.total ?? 0)));
 }

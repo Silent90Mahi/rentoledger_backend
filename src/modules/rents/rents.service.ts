@@ -1,15 +1,16 @@
-import { db } from '../../db/knex.js';
+import type { Document } from 'mongodb';
+import { $round2, col, contains, lockDoc, newId, withTransaction } from '../../db/mongo.js';
 import type { Ctx } from '../../lib/context.js';
 import { humanDate, monthEnd, monthStart } from '../../lib/dates.js';
 import { Errors } from '../../lib/errors.js';
 import { formatInr, gstFor, round2, subtractMoney } from '../../lib/money.js';
-import { likePattern, resolveSort } from '../../lib/validation.js';
+import { resolveSort } from '../../lib/validation.js';
 import { logActivity } from '../activity/activity.service.js';
 import { notifyTenant } from '../notifications/notifications.service.js';
 import { allocateTenant, clearChargeAllocations, tenantAdvanceCredit, trimChargeAllocations } from '../payments/allocation.service.js';
 import { METHOD_LABELS, type PaymentMethod, type RecordableMethod } from '../payments/payment.types.js';
 import { createPayment, type PaymentDetailDto } from '../payments/payments.service.js';
-import { chargeQuery, mapCharge, periodLabelFor, type ChargeKind, type RentEntryDto } from './charge-query.js';
+import { chargeRefStages, chargeStatusStages, findCharges, mapCharge, periodLabelFor, type ChargeKind, type RentEntryDto } from './charge-query.js';
 import { ensureAccountCharges } from './generation.service.js';
 
 export type LedgerFilter = 'all' | 'overdue' | 'to_confirm' | 'pending' | 'partial' | 'collected' | 'unpaid' | 'void';
@@ -59,107 +60,128 @@ export async function listRents(
   const sort = resolveSort(
     opts.sort,
     {
-      dueDate: 'x.due_date',
-      amount: 'x.total_amount',
-      balance: 'x.balance',
-      unit: 'lower(x.unit_name)',
-      tenant: 'lower(x.tenant_name)',
-      period: 'x.period_start',
-      createdAt: 'x.created_at',
+      dueDate: 'due_date',
+      amount: 'total_amount',
+      balance: 'balance',
+      unit: '_unit_lc',
+      tenant: '_tenant_lc',
+      period: 'period_start',
+      createdAt: 'created_at',
     },
-    { column: 'x.due_date', direction: 'asc' },
+    { column: 'due_date', direction: 'asc' },
   );
 
-  const inner = chargeQuery(db, { accountId: ctx.accountId }, ctx.today).modify((q) => {
-    if (opts.month) q.whereBetween('c.period_start', [monthStart(opts.month), monthEnd(opts.month)]);
-    if (opts.propertyId) q.where('p.id', opts.propertyId);
-    if (opts.unitId) q.where('c.unit_id', opts.unitId);
-    if (opts.tenantId) q.where('c.tenant_id', opts.tenantId);
-    if (opts.agreementId) q.where('c.agreement_id', opts.agreementId);
-    if (opts.kind) q.where('c.kind', opts.kind);
-    if (opts.search) {
-      const pattern = likePattern(opts.search);
-      q.where((w) =>
-        w
-          .whereILike('u.name', pattern)
-          .orWhereILike('t.name', pattern)
-          .orWhereILike('t.business_name', pattern)
-          .orWhereILike('p.name', pattern)
-          .orWhereILike('c.description', pattern),
-      );
-    }
-  });
+  const match: Document = {};
+  if (opts.month) match.period_start = { $gte: monthStart(opts.month), $lte: monthEnd(opts.month) };
+  if (opts.unitId) match.unit_id = opts.unitId;
+  if (opts.tenantId) match.tenant_id = opts.tenantId;
+  if (opts.agreementId) match.agreement_id = opts.agreementId;
+  if (opts.kind) match.kind = opts.kind;
+  if (opts.propertyId) {
+    const unitIds = await col('units').distinct('_id', { account_id: ctx.accountId, property_id: opts.propertyId });
+    match.unit_id = opts.unitId ? (unitIds.includes(opts.unitId) ? opts.unitId : '__none__') : { $in: unitIds };
+  }
 
-  const [agg] = await db
-    .from(inner.clone().as('x'))
-    .select(
-      db.raw(`COUNT(*) FILTER (WHERE x.status <> 'void') AS all_count`),
-      db.raw(`COUNT(*) FILTER (WHERE x.status = 'overdue') AS overdue_count`),
-      db.raw(`COUNT(*) FILTER (WHERE x.status = 'to_confirm') AS to_confirm_count`),
-      db.raw(`COUNT(*) FILTER (WHERE x.status = 'pending') AS pending_count`),
-      db.raw(`COUNT(*) FILTER (WHERE x.is_partial) AS partial_count`),
-      db.raw(`COUNT(*) FILTER (WHERE x.status = 'collected') AS collected_count`),
-      db.raw(`COUNT(*) FILTER (WHERE x.status = 'void') AS void_count`),
-      db.raw(`COALESCE(SUM(x.total_amount) FILTER (WHERE x.status <> 'void'), 0) AS expected`),
-      db.raw(`COALESCE(SUM(x.paid_amount) FILTER (WHERE x.status <> 'void'), 0) AS collected`),
-      db.raw(`COALESCE(SUM(x.balance) FILTER (WHERE x.status <> 'void'), 0) AS outstanding`),
-      db.raw(`COALESCE(SUM(x.balance) FILTER (WHERE x.is_overdue), 0) AS overdue`),
-      db.raw(
-        `COALESCE(SUM(CASE WHEN x.total_amount > 0 THEN x.paid_amount * x.gst_amount / x.total_amount ELSE 0 END) FILTER (WHERE x.status <> 'void'), 0) AS gst_collected`,
-      ),
-    );
+  const pipeline: Document[] = [...chargeStatusStages({ accountId: ctx.accountId }, ctx.today, match), ...chargeRefStages()];
+  if (opts.search) {
+    const pattern = contains(opts.search);
+    pipeline.push({
+      $match: { $or: [{ unit_name: pattern }, { tenant_name: pattern }, { tenant_business_name: pattern }, { property_name: pattern }, { description: pattern }] },
+    });
+  }
+  pipeline.push({ $addFields: { _unit_lc: { $toLower: { $ifNull: ['$unit_name', ''] } }, _tenant_lc: { $toLower: { $ifNull: ['$tenant_name', ''] } } } });
 
-  const counts: LedgerCounts = {
-    all: Number(agg.all_count),
-    overdue: Number(agg.overdue_count),
-    to_confirm: Number(agg.to_confirm_count),
-    pending: Number(agg.pending_count),
-    partial: Number(agg.partial_count),
-    collected: Number(agg.collected_count),
-    void: Number(agg.void_count),
-  };
-
-  const filtered = db.from(inner.as('x')).modify((q) => {
+  const statusMatch: Document = (() => {
     switch (opts.status ?? 'all') {
       case 'all':
-        q.whereNot('x.status', 'void');
-        break;
+        return { status: { $ne: 'void' } };
       case 'partial':
-        q.where('x.is_partial', true);
-        break;
+        return { is_partial: true };
       case 'unpaid':
-        q.whereIn('x.status', ['overdue', 'pending', 'to_confirm']);
-        break;
+        return { status: { $in: ['overdue', 'pending', 'to_confirm'] } };
       default:
-        q.where('x.status', opts.status!);
+        return { status: opts.status };
     }
-  });
-  const [{ count }] = await filtered.clone().count<{ count: number }[]>({ count: '*' });
-  const rows = await filtered
-    .select('x.*')
-    .orderByRaw(`${sort.column} ${sort.direction}, lower(x.unit_name) ASC, x.id`)
-    .limit(opts.pageSize)
-    .offset((opts.page - 1) * opts.pageSize);
+  })();
+
+  const notVoid = { $ne: ['$status', 'void'] };
+  const [result] = await col('rent_charges')
+    .aggregate([
+      ...pipeline,
+      {
+        $facet: {
+          agg: [
+            {
+              $group: {
+                _id: null,
+                all_count: { $sum: { $cond: [notVoid, 1, 0] } },
+                overdue_count: { $sum: { $cond: [{ $eq: ['$status', 'overdue'] }, 1, 0] } },
+                to_confirm_count: { $sum: { $cond: [{ $eq: ['$status', 'to_confirm'] }, 1, 0] } },
+                pending_count: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+                partial_count: { $sum: { $cond: ['$is_partial', 1, 0] } },
+                collected_count: { $sum: { $cond: [{ $eq: ['$status', 'collected'] }, 1, 0] } },
+                void_count: { $sum: { $cond: [{ $eq: ['$status', 'void'] }, 1, 0] } },
+                expected: { $sum: { $cond: [notVoid, '$total_amount', 0] } },
+                collected: { $sum: { $cond: [notVoid, '$paid_amount', 0] } },
+                outstanding: { $sum: { $cond: [notVoid, '$balance', 0] } },
+                overdue: { $sum: { $cond: ['$is_overdue', '$balance', 0] } },
+                gst_collected: {
+                  $sum: {
+                    $cond: [
+                      { $and: [notVoid, { $gt: ['$total_amount', 0] }] },
+                      { $divide: [{ $multiply: ['$paid_amount', '$gst_amount'] }, '$total_amount'] },
+                      0,
+                    ],
+                  },
+                },
+              },
+            },
+          ],
+          total: [{ $match: statusMatch }, { $count: 'count' }],
+          rows: [
+            { $match: statusMatch },
+            { $sort: { [sort.column]: sort.direction === 'asc' ? 1 : -1, _unit_lc: 1, _id: 1 } },
+            { $skip: (opts.page - 1) * opts.pageSize },
+            { $limit: opts.pageSize },
+          ],
+        },
+      },
+    ])
+    .toArray();
+
+  const agg = result.agg[0] ?? {};
+  const counts: LedgerCounts = {
+    all: agg.all_count ?? 0,
+    overdue: agg.overdue_count ?? 0,
+    to_confirm: agg.to_confirm_count ?? 0,
+    pending: agg.pending_count ?? 0,
+    partial: agg.partial_count ?? 0,
+    collected: agg.collected_count ?? 0,
+    void: agg.void_count ?? 0,
+  };
 
   let earlierDues: { amount: number; count: number } | null = null;
   if (opts.month) {
-    const [earlier] = await db
-      .from(chargeQuery(db, { accountId: ctx.accountId }, ctx.today).where('c.period_start', '<', monthStart(opts.month)).as('e'))
-      .whereIn('e.status', ['overdue', 'pending', 'to_confirm'])
-      .select(db.raw('COALESCE(SUM(e.balance), 0) AS amount'), db.raw('COUNT(*) AS count'));
-    earlierDues = { amount: Number(earlier.amount), count: Number(earlier.count) };
+    const [earlier] = await col('rent_charges')
+      .aggregate([
+        ...chargeStatusStages({ accountId: ctx.accountId }, ctx.today, { period_start: { $lt: monthStart(opts.month) } }),
+        { $match: { status: { $in: ['overdue', 'pending', 'to_confirm'] } } },
+        { $group: { _id: null, amount: { $sum: '$balance' }, count: { $sum: 1 } } },
+      ])
+      .toArray();
+    earlierDues = { amount: round2(earlier?.amount ?? 0), count: earlier?.count ?? 0 };
   }
 
   return {
-    items: rows.map((r: Record<string, any>) => mapCharge(r, ctx.today)),
-    total: Number(count),
+    items: result.rows.map((r: Record<string, any>) => mapCharge(r, ctx.today)),
+    total: result.total[0]?.count ?? 0,
     counts,
     totals: {
-      expected: Number(agg.expected),
-      collected: Number(agg.collected),
-      outstanding: Number(agg.outstanding),
-      overdue: Number(agg.overdue),
-      gstCollected: round2(Number(agg.gst_collected)),
+      expected: round2(agg.expected ?? 0),
+      collected: round2(agg.collected ?? 0),
+      outstanding: round2(agg.outstanding ?? 0),
+      overdue: round2(agg.overdue ?? 0),
+      gstCollected: round2(agg.gst_collected ?? 0),
     },
     earlierDues,
   };
@@ -220,61 +242,84 @@ export interface RentEntryDetailDto extends RentEntryDto {
 }
 
 export async function getRent(ctx: Ctx, id: string): Promise<RentEntryDetailDto> {
-  const row = await db.from(chargeQuery(db, { accountId: ctx.accountId }, ctx.today).where('c.id', id).as('x')).first();
+  const [row] = await findCharges({ accountId: ctx.accountId }, ctx.today, { _id: id });
   if (!row) throw Errors.notFound('Rent entry');
   const entry = mapCharge(row, ctx.today);
 
-  const agreement = await db('agreements').where({ id: entry.agreementId }).first();
+  const agreement = await col('agreements').findOne({ _id: entry.agreementId });
+  if (!agreement) throw Errors.notFound('Agreement');
 
   // Statement-style view of the agreement as at this period (see README "Balance calculation"):
   //   previousDue = earlier charges - payments made before this period applied to them
   //   paid        = payments applied to this entry + payments made since this period applied to earlier entries
   //   remaining   = previousDue + this period's total - paid  (= live outstanding up to this entry)
-  const { rows: calcRows } = await db.raw<{ rows: Array<{ earlier_total: number; earlier_paid_before: number; earlier_paid_since: number }> }>(
-    `SELECT
-        COALESCE((SELECT SUM(c.total_amount) FROM rent_charges c
-                   WHERE c.agreement_id = :agreementId AND c.voided_at IS NULL AND c.id <> :chargeId
-                     AND (c.period_start < :periodStart OR (c.period_start = :periodStart AND c.kind = 'opening_balance' AND :kind <> 'opening_balance'))), 0) AS earlier_total,
-        COALESCE((SELECT SUM(pa.amount) FROM payment_allocations pa
-                    JOIN rent_charges c ON c.id = pa.charge_id
-                    JOIN payments p ON p.id = pa.payment_id
-                   WHERE c.agreement_id = :agreementId AND c.voided_at IS NULL AND c.id <> :chargeId
-                     AND (c.period_start < :periodStart OR (c.period_start = :periodStart AND c.kind = 'opening_balance' AND :kind <> 'opening_balance'))
-                     AND p.paid_on < :periodStart), 0) AS earlier_paid_before,
-        COALESCE((SELECT SUM(pa.amount) FROM payment_allocations pa
-                    JOIN rent_charges c ON c.id = pa.charge_id
-                    JOIN payments p ON p.id = pa.payment_id
-                   WHERE c.agreement_id = :agreementId AND c.voided_at IS NULL AND c.id <> :chargeId
-                     AND (c.period_start < :periodStart OR (c.period_start = :periodStart AND c.kind = 'opening_balance' AND :kind <> 'opening_balance'))
-                     AND p.paid_on >= :periodStart), 0) AS earlier_paid_since`,
-    { agreementId: entry.agreementId, chargeId: entry.id, periodStart: entry.periodStart, kind: entry.kind },
+  const earlierCharges = await col('rent_charges')
+    .find({
+      agreement_id: entry.agreementId,
+      voided_at: null,
+      _id: { $ne: entry.id },
+      $or: [
+        { period_start: { $lt: entry.periodStart } },
+        ...(entry.kind !== 'opening_balance' ? [{ period_start: entry.periodStart, kind: 'opening_balance' }] : []),
+      ],
+    })
+    .project({ total_amount: 1 })
+    .toArray();
+  const earlierTotal = round2(earlierCharges.reduce((sum, c) => sum + Number(c.total_amount), 0));
+  const earlierAllocations = earlierCharges.length
+    ? await col('payment_allocations').find({ charge_id: { $in: earlierCharges.map((c) => c._id) } }).toArray()
+    : [];
+  const allocationPayments = new Map(
+    (await col('payments').find({ _id: { $in: [...new Set(earlierAllocations.map((a) => a.payment_id))] } }, { projection: { paid_on: 1 } }).toArray()).map((p) => [
+      p._id,
+      p.paid_on as string,
+    ]),
   );
-  const calc = calcRows[0];
+  let earlierPaidBefore = 0;
+  let earlierPaidSince = 0;
+  for (const a of earlierAllocations) {
+    const paidOn = allocationPayments.get(a.payment_id);
+    if (!paidOn) continue;
+    if (paidOn < entry.periodStart) earlierPaidBefore = round2(earlierPaidBefore + a.amount);
+    else earlierPaidSince = round2(earlierPaidSince + a.amount);
+  }
+
   const isVoid = entry.status === 'void';
-  const previousDue = isVoid ? 0 : subtractMoney(Number(calc.earlier_total), Number(calc.earlier_paid_before));
+  const previousDue = isVoid ? 0 : subtractMoney(earlierTotal, earlierPaidBefore);
   const periodTotal = isVoid ? 0 : entry.totalAmount;
-  const paid = isVoid ? 0 : round2(entry.paidAmount + Number(calc.earlier_paid_since));
+  const paid = isVoid ? 0 : round2(entry.paidAmount + earlierPaidSince);
   const totalPayable = round2(previousDue + periodTotal);
 
-  const payments = await db('payment_allocations as pa')
-    .join('payments as p', 'p.id', 'pa.payment_id')
-    .where('pa.charge_id', id)
-    .orderBy([
-      { column: 'p.paid_on', order: 'asc' },
-      { column: 'p.created_at', order: 'asc' },
+  const payments = await col('payment_allocations')
+    .aggregate([
+      { $match: { charge_id: id } },
+      { $lookup: { from: 'payments', localField: 'payment_id', foreignField: '_id', as: 'p' } },
+      { $unwind: '$p' },
+      { $sort: { 'p.paid_on': 1, 'p.created_at': 1 } },
+      {
+        $project: {
+          allocated: '$amount',
+          id: '$p._id',
+          amount: '$p.amount',
+          paid_on: '$p.paid_on',
+          method: '$p.method',
+          reference: '$p.reference',
+          source: '$p.source',
+        },
+      },
     ])
-    .select('pa.amount as allocated', 'p.id', 'p.amount', 'p.paid_on', 'p.method', 'p.reference', 'p.source');
+    .toArray();
 
-  const pending = await db('payments')
-    .where({ target_charge_id: id, status: 'pending', account_id: ctx.accountId })
-    .orderBy('created_at', 'asc');
+  const pending = (
+    await col('payments').find({ target_charge_id: id, status: 'pending', account_id: ctx.accountId }).sort({ created_at: 1 }).toArray()
+  ).map((p): Record<string, any> => ({ ...p, id: p._id }));
 
-  const advanceCredit = await tenantAdvanceCredit(db, entry.tenant.id);
+  const advanceCredit = await tenantAdvanceCredit(entry.tenant.id);
 
   return {
     ...entry,
     agreement: {
-      id: agreement.id,
+      id: agreement._id,
       status: agreement.status,
       rentAmount: Number(agreement.rent_amount),
       billingCycle: agreement.billing_cycle,
@@ -282,8 +327,8 @@ export async function getRent(ctx: Ctx, id: string): Promise<RentEntryDetailDto>
       gstApplicable: agreement.gst_applicable,
       gstRate: Number(agreement.gst_rate),
       startDate: agreement.start_date,
-      endDate: agreement.end_date,
-      endedOn: agreement.ended_on,
+      endDate: agreement.end_date ?? null,
+      endedOn: agreement.ended_on ?? null,
     },
     calculation: {
       baseAmount: entry.baseAmount,
@@ -305,7 +350,7 @@ export async function getRent(ctx: Ctx, id: string): Promise<RentEntryDetailDto>
       paidOn: p.paid_on,
       method: p.method,
       methodLabel: METHOD_LABELS[p.method as PaymentMethod] ?? p.method,
-      reference: p.reference,
+      reference: p.reference ?? null,
       source: p.source,
     })),
     pendingPayments: pending.map((p) => ({
@@ -314,8 +359,8 @@ export async function getRent(ctx: Ctx, id: string): Promise<RentEntryDetailDto>
       paidOn: p.paid_on,
       method: p.method,
       methodLabel: METHOD_LABELS[p.method as PaymentMethod] ?? p.method,
-      reference: p.reference,
-      notes: p.notes,
+      reference: p.reference ?? null,
+      notes: p.notes ?? null,
       source: p.source,
       createdAt: p.created_at,
     })),
@@ -341,8 +386,8 @@ export async function createCharge(
     periodEnd?: string | null;
   },
 ): Promise<RentEntryDetailDto> {
-  const id = await db.transaction(async (trx) => {
-    const agreement = await trx('agreements').where({ id: input.agreementId, account_id: ctx.accountId }).first();
+  const id = await withTransaction(async (session) => {
+    const agreement = await col('agreements').findOne({ _id: input.agreementId, account_id: ctx.accountId }, { session });
     if (!agreement) throw Errors.validation('Agreement not found.', [{ field: 'agreementId', message: 'Agreement not found' }]);
     const periodStart = input.periodStart ?? input.dueDate;
     const periodEnd = input.periodEnd ?? periodStart;
@@ -350,10 +395,14 @@ export async function createCharge(
       throw Errors.validation('Period end must be on or after period start.', [{ field: 'periodEnd', message: 'Invalid period' }]);
     }
     const rate = input.gstApplicable ? Number(agreement.gst_rate) || ctx.gstRate : 0;
-    const [row] = await trx('rent_charges')
-      .insert({
+    const gstAmount = gstFor(input.amount, rate);
+    const chargeId = newId();
+    const now = new Date();
+    await col('rent_charges').insertOne(
+      {
+        _id: chargeId,
         account_id: ctx.accountId,
-        agreement_id: agreement.id,
+        agreement_id: agreement._id,
         tenant_id: agreement.tenant_id,
         unit_id: agreement.unit_id,
         kind: input.kind,
@@ -363,19 +412,25 @@ export async function createCharge(
         due_date: input.dueDate,
         base_amount: input.amount,
         gst_rate: rate,
-        gst_amount: gstFor(input.amount, rate),
+        gst_amount: gstAmount,
+        total_amount: round2(input.amount + gstAmount),
+        voided_at: null,
+        void_reason: null,
         created_by: ctx.userId,
-      })
-      .returning('id');
-    await allocateTenant(trx, ctx.accountId, agreement.tenant_id);
-    const tenant = await trx('tenants').where({ id: agreement.tenant_id }).first('name');
-    await logActivity(trx, ctx, {
+        created_at: now,
+        updated_at: now,
+      },
+      { session },
+    );
+    await allocateTenant(session, ctx.accountId, agreement.tenant_id);
+    const tenant = await col('tenants').findOne({ _id: agreement.tenant_id }, { session });
+    await logActivity(session, ctx, {
       action: 'charge.created',
       entityType: 'charge',
-      entityId: row.id,
+      entityId: chargeId,
       summary: `Added ${periodLabelFor(input.kind, periodStart, periodEnd).toLowerCase()} of ${formatInr(input.amount)} for ${tenant?.name}`,
     });
-    return row.id as string;
+    return chargeId;
   });
   return getRent(ctx, id);
 }
@@ -385,8 +440,8 @@ export async function updateCharge(
   id: string,
   input: { baseAmount?: number; dueDate?: string; description?: string | null; reason?: string | null },
 ): Promise<RentEntryDetailDto> {
-  await db.transaction(async (trx) => {
-    const charge = await trx('rent_charges').where({ id, account_id: ctx.accountId }).forUpdate().first();
+  await withTransaction(async (session) => {
+    const charge = await col('rent_charges').findOne({ _id: id, account_id: ctx.accountId }, { session });
     if (!charge) throw Errors.notFound('Rent entry');
     if (charge.voided_at) throw Errors.conflict('Cancelled entries cannot be edited.');
     const changes: Record<string, unknown> = {};
@@ -394,6 +449,7 @@ export async function updateCharge(
     if (input.baseAmount !== undefined && input.baseAmount !== Number(charge.base_amount)) {
       changes.base_amount = input.baseAmount;
       changes.gst_amount = gstFor(input.baseAmount, Number(charge.gst_rate));
+      changes.total_amount = round2(input.baseAmount + Number(changes.gst_amount));
       notes.push(`amount ${formatInr(Number(charge.base_amount))} → ${formatInr(input.baseAmount)}`);
     }
     if (input.dueDate !== undefined && input.dueDate !== charge.due_date) {
@@ -403,14 +459,13 @@ export async function updateCharge(
     if (input.description !== undefined) changes.description = input.description;
     if (!Object.keys(changes).length) return;
 
-    await trx('rent_charges').where({ id }).update(changes);
-    if (changes.base_amount !== undefined) {
-      const newTotal = round2(Number(changes.base_amount) + Number(changes.gst_amount));
-      await trimChargeAllocations(trx, id, newTotal);
+    await col('rent_charges').updateOne({ _id: id }, { $set: { ...changes, updated_at: new Date() }, $inc: { lock_version: 1 } }, { session });
+    if (changes.total_amount !== undefined) {
+      await trimChargeAllocations(session, id, Number(changes.total_amount));
     }
-    await allocateTenant(trx, ctx.accountId, charge.tenant_id);
-    const unit = await trx('units').where({ id: charge.unit_id }).first('name');
-    await logActivity(trx, ctx, {
+    await allocateTenant(session, ctx.accountId, charge.tenant_id);
+    const unit = await col('units').findOne({ _id: charge.unit_id }, { session });
+    await logActivity(session, ctx, {
       action: 'charge.updated',
       entityType: 'charge',
       entityId: id,
@@ -421,15 +476,16 @@ export async function updateCharge(
 }
 
 export async function voidCharge(ctx: Ctx, id: string, reason: string): Promise<RentEntryDetailDto> {
-  await db.transaction(async (trx) => {
-    const charge = await trx('rent_charges').where({ id, account_id: ctx.accountId }).forUpdate().first();
+  await withTransaction(async (session) => {
+    const charge = await col('rent_charges').findOne({ _id: id, account_id: ctx.accountId }, { session });
     if (!charge) throw Errors.notFound('Rent entry');
     if (charge.voided_at) throw Errors.conflict('This entry is already cancelled.');
-    await clearChargeAllocations(trx, id);
-    await trx('rent_charges').where({ id }).update({ voided_at: new Date(), void_reason: reason });
-    await allocateTenant(trx, ctx.accountId, charge.tenant_id);
-    const unit = await trx('units').where({ id: charge.unit_id }).first('name');
-    await logActivity(trx, ctx, {
+    await lockDoc('rent_charges', id, session);
+    await clearChargeAllocations(session, id);
+    await col('rent_charges').updateOne({ _id: id }, { $set: { voided_at: new Date(), void_reason: reason, updated_at: new Date() } }, { session });
+    await allocateTenant(session, ctx.accountId, charge.tenant_id);
+    const unit = await col('units').findOne({ _id: charge.unit_id }, { session });
+    await logActivity(session, ctx, {
       action: 'charge.voided',
       entityType: 'charge',
       entityId: id,
@@ -467,7 +523,7 @@ export async function remindCharge(
 ): Promise<{ message: string; phone: string; whatsappUrl: string; smsUrl: string; notifiedInApp: boolean }> {
   const entry = await getRent(ctx, id);
   if (entry.status === 'void' || entry.balance <= 0) throw Errors.conflict('There is nothing due on this entry.');
-  const account = await db('accounts').where({ id: ctx.accountId }).first();
+  const account = await col('accounts').findOne({ _id: ctx.accountId });
   const dueText = entry.isOverdue ? `was due on ${humanDate(entry.dueDate)}` : `is due on ${humanDate(entry.dueDate)}`;
   const payHint = account?.upi_id ? ` You can pay via UPI to ${account.upi_id}.` : '';
   const message =
@@ -475,8 +531,8 @@ export async function remindCharge(
     `(${entry.periodLabel}) ${dueText}.${payHint} Thank you! — ${account?.payee_name || ctx.accountName}`;
   const digits = entry.tenant.phone.replace(/\D/g, '');
 
-  const notified = await db.transaction(async (trx) => {
-    const count = await notifyTenant(trx, entry.tenant.id, {
+  const notified = await withTransaction(async (session) => {
+    const count = await notifyTenant(session, entry.tenant.id, {
       type: 'reminder',
       title: `Rent reminder: ${formatInr(entry.balance)} ${entry.isOverdue ? 'overdue' : 'due'}`,
       body: message,
@@ -484,7 +540,7 @@ export async function remindCharge(
       entityId: entry.id,
       dedupeKey: `reminder:${entry.id}:${ctx.today}`,
     });
-    await logActivity(trx, ctx, {
+    await logActivity(session, ctx, {
       action: 'charge.reminded',
       entityType: 'charge',
       entityId: entry.id,

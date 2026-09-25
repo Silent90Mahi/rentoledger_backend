@@ -174,7 +174,7 @@ export const paginationShape = {
   sort: zSort,
 };
 
-/** Resolves a `sort` query param (e.g. `-createdAt`) against a whitelist of SQL columns. */
+/** Resolves a `sort` query param (e.g. `-createdAt`) against a whitelist of sortable fields. */
 export function resolveSort(
   sort: string | undefined,
   allowed: Record<string, string>,
@@ -202,7 +202,24 @@ export function idParam(req: { params: Record<string, string | string[] | undefi
   return result.data.id;
 }
 
-/** Escapes LIKE/ILIKE wildcards in user supplied search terms. */
-export function likePattern(term: string): string {
-  return `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+
+/**
+ * Comparator for sorting already-loaded rows by a field: nulls last,
+ * case-insensitive natural order for text ("Shop 2" before "Shop 10").
+ */
+export function compareRows(a: Record<string, any>, b: Record<string, any>, field: string, direction: 'asc' | 'desc'): number {
+  const x = a[field];
+  const y = b[field];
+  const xMissing = x === null || x === undefined;
+  const yMissing = y === null || y === undefined;
+  if (xMissing || yMissing) {
+    if (xMissing && yMissing) return String(a.id ?? '').localeCompare(String(b.id ?? ''));
+    return xMissing ? 1 : -1;
+  }
+  let result: number;
+  if (typeof x === 'number' && typeof y === 'number') result = x - y;
+  else if (x instanceof Date && y instanceof Date) result = x.getTime() - y.getTime();
+  else result = String(x).localeCompare(String(y), 'en', { sensitivity: 'base', numeric: true });
+  if (result === 0) return String(a.id ?? '').localeCompare(String(b.id ?? ''));
+  return direction === 'asc' ? result : -result;
 }

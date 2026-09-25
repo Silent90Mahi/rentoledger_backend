@@ -1,12 +1,12 @@
-import { db } from '../../db/knex.js';
+import type { Document } from 'mongodb';
+import { col, contains, escapeRegex } from '../../db/mongo.js';
 import type { Ctx } from '../../lib/context.js';
 import { diffDays, monthKeyOf, monthKeysBetween, monthLabel, shortMonthLabel } from '../../lib/dates.js';
 import { Errors } from '../../lib/errors.js';
 import { round2 } from '../../lib/money.js';
-import { likePattern } from '../../lib/validation.js';
 import { EXPENSE_CATEGORY_LABELS, type ExpenseCategory } from '../expenses/expenses.service.js';
-import { allocationTotals, collectedByProperty, expectedByProperty, expensesByProperty, duesByProperty } from '../finance/finance.queries.js';
-import { chargeQuery } from '../rents/charge-query.js';
+import { collectedByProperty, expectedByProperty, expensesByProperty, duesByProperty } from '../finance/finance.queries.js';
+import { chargeRefStages, chargeStatusStages } from '../rents/charge-query.js';
 import { ensureAccountCharges } from '../rents/generation.service.js';
 import { unitsWithOccupancy } from '../units/occupancy.js';
 
@@ -24,16 +24,21 @@ function assertRange(range: DateRange) {
   }
 }
 
+async function sumOf(name: 'payments' | 'expenses', match: Document, field: string): Promise<number> {
+  const [r] = await col(name).aggregate([{ $match: match }, { $group: { _id: null, total: { $sum: `$${field}` } } }]).toArray();
+  return round2(r?.total ?? 0);
+}
+
+async function unitIdsOfProperty(ctx: Ctx, propertyId: string): Promise<string[]> {
+  return col('units').distinct('_id', { account_id: ctx.accountId, property_id: propertyId });
+}
+
 /** Cash received in the range, optionally restricted to one property (attribution via allocations/unit). */
 async function cashCollected(ctx: Ctx, range: DateRange, propertyId?: string): Promise<number> {
   if (!propertyId) {
-    const [row] = await db('payments')
-      .where({ account_id: ctx.accountId, status: 'confirmed' })
-      .whereBetween('paid_on', [range.from, range.to])
-      .sum({ total: 'amount' });
-    return Number(row?.total ?? 0);
+    return sumOf('payments', { account_id: ctx.accountId, status: 'confirmed', paid_on: { $gte: range.from, $lte: range.to } }, 'amount');
   }
-  const byProperty = await collectedByProperty(db, ctx.accountId, range.from, range.to);
+  const byProperty = await collectedByProperty(ctx.accountId, range.from, range.to);
   return byProperty.get(propertyId) ?? 0;
 }
 
@@ -41,67 +46,83 @@ export async function reportSummary(ctx: Ctx, range: DateRange & { propertyId?: 
   assertRange(range);
   await ensureAccountCharges(ctx.accountId, ctx.today);
 
-  const scoped = chargeQuery(db, { accountId: ctx.accountId }, ctx.today).modify((q) => {
-    if (range.propertyId) q.where('p.id', range.propertyId);
-  });
+  const unitFilter = range.propertyId ? { unit_id: { $in: await unitIdsOfProperty(ctx, range.propertyId) } } : {};
+  const status = (match: Document) => chargeStatusStages({ accountId: ctx.accountId }, ctx.today, { ...unitFilter, ...match });
 
-  const [billed] = await db
-    .from(scoped.clone().whereBetween('c.due_date', [range.from, range.to]).as('x'))
-    .whereNot('x.status', 'void')
-    .whereNot('x.kind', 'opening_balance')
-    .select(
-      db.raw('COALESCE(SUM(x.total_amount), 0) AS expected'),
-      db.raw('COALESCE(SUM(x.paid_amount), 0) AS collected_of_expected'),
-      db.raw('COALESCE(SUM(x.gst_amount), 0) AS gst_billed'),
-      db.raw('COUNT(*) AS entries'),
-    );
-  const [dues] = await db
-    .from(scoped.clone().where('c.due_date', '<=', range.to).as('x'))
-    .whereNot('x.status', 'void')
-    .select(
-      db.raw('COALESCE(SUM(x.balance), 0) AS outstanding'),
-      db.raw('COALESCE(SUM(x.balance) FILTER (WHERE x.is_overdue), 0) AS overdue'),
-    );
+  const [billed = {}] = await col('rent_charges')
+    .aggregate([
+      ...status({ due_date: { $gte: range.from, $lte: range.to } }),
+      { $match: { status: { $ne: 'void' }, kind: { $ne: 'opening_balance' } } },
+      {
+        $group: {
+          _id: null,
+          expected: { $sum: '$total_amount' },
+          collected_of_expected: { $sum: '$paid_amount' },
+          gst_billed: { $sum: '$gst_amount' },
+          entries: { $sum: 1 },
+        },
+      },
+    ])
+    .toArray();
+  const [dues = {}] = await col('rent_charges')
+    .aggregate([
+      ...status({ due_date: { $lte: range.to } }),
+      { $match: { status: { $ne: 'void' } } },
+      { $group: { _id: null, outstanding: { $sum: '$balance' }, overdue: { $sum: { $cond: ['$is_overdue', '$balance', 0] } } } },
+    ])
+    .toArray();
 
   // GST share of the cash received in the range.
-  const { rows: gstRows } = await db.raw<{ rows: Array<{ gst: number }> }>(
-    `SELECT COALESCE(SUM(CASE WHEN c.total_amount > 0 THEN pa.amount * c.gst_amount / c.total_amount ELSE 0 END), 0) AS gst
-       FROM payment_allocations pa
-       JOIN payments p ON p.id = pa.payment_id
-       JOIN rent_charges c ON c.id = pa.charge_id
-       JOIN units u ON u.id = c.unit_id
-      WHERE p.account_id = ? AND p.status = 'confirmed' AND p.paid_on BETWEEN ?::date AND ?::date
-        ${range.propertyId ? 'AND u.property_id = ?' : ''}`,
-    range.propertyId ? [ctx.accountId, range.from, range.to, range.propertyId] : [ctx.accountId, range.from, range.to],
-  );
+  const [gstRow] = await col('payments')
+    .aggregate([
+      { $match: { account_id: ctx.accountId, status: 'confirmed', paid_on: { $gte: range.from, $lte: range.to } } },
+      { $lookup: { from: 'payment_allocations', localField: '_id', foreignField: 'payment_id', as: 'pa' } },
+      { $unwind: '$pa' },
+      { $lookup: { from: 'rent_charges', localField: 'pa.charge_id', foreignField: '_id', as: 'c' } },
+      { $unwind: '$c' },
+      ...(range.propertyId ? [{ $match: { 'c.unit_id': unitFilter.unit_id } }] : []),
+      {
+        $group: {
+          _id: null,
+          gst: { $sum: { $cond: [{ $gt: ['$c.total_amount', 0] }, { $divide: [{ $multiply: ['$pa.amount', '$c.gst_amount'] }, '$c.total_amount'] }, 0] } },
+        },
+      },
+    ])
+    .toArray();
 
   const collected = await cashCollected(ctx, range, range.propertyId);
   const expenses = range.propertyId
-    ? ((await expensesByProperty(db, ctx.accountId, range.from, range.to)).get(range.propertyId) ?? 0)
-    : Number(
-        (
-          await db('expenses').where({ account_id: ctx.accountId }).whereBetween('expense_date', [range.from, range.to]).sum({ total: 'amount' })
-        )[0]?.total ?? 0,
-      );
+    ? ((await expensesByProperty(ctx.accountId, range.from, range.to)).get(range.propertyId) ?? 0)
+    : await sumOf('expenses', { account_id: ctx.accountId, expense_date: { $gte: range.from, $lte: range.to } }, 'amount');
 
-  const [deposits] = await db('deposit_transactions as d')
-    .join('agreements as a', 'a.id', 'd.agreement_id')
-    .join('units as u', 'u.id', 'a.unit_id')
-    .where('d.account_id', ctx.accountId)
-    .modify((q) => {
-      if (range.propertyId) q.where('u.property_id', range.propertyId);
-    })
-    .select(
-      db.raw(`COALESCE(SUM(CASE WHEN d.type = 'received' THEN d.amount ELSE -d.amount END), 0) AS held`),
-      db.raw(`COALESCE(SUM(d.amount) FILTER (WHERE d.type = 'deducted' AND d.txn_date BETWEEN ?::date AND ?::date), 0) AS deducted`, [
-        range.from,
-        range.to,
-      ]),
-    );
+  const depositMatch: Document = { account_id: ctx.accountId };
+  if (range.propertyId) {
+    depositMatch.agreement_id = { $in: await col('agreements').distinct('_id', { account_id: ctx.accountId, ...unitFilter }) };
+  }
+  const [deposits = {}] = await col('deposit_transactions')
+    .aggregate([
+      { $match: depositMatch },
+      {
+        $group: {
+          _id: null,
+          held: { $sum: { $cond: [{ $eq: ['$type', 'received'] }, '$amount', { $multiply: ['$amount', -1] }] } },
+          deducted: {
+            $sum: {
+              $cond: [
+                { $and: [{ $eq: ['$type', 'deducted'] }, { $gte: ['$txn_date', range.from] }, { $lte: ['$txn_date', range.to] }] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ])
+    .toArray();
 
-  const expected = Number(billed.expected);
-  const collectedOfExpected = Number(billed.collected_of_expected);
-  const depositDeductions = Number(deposits?.deducted ?? 0);
+  const expected = round2(billed.expected ?? 0);
+  const collectedOfExpected = round2(billed.collected_of_expected ?? 0);
+  const depositDeductions = round2(deposits.deducted ?? 0);
   return {
     from: range.from,
     to: range.to,
@@ -110,79 +131,84 @@ export async function reportSummary(ctx: Ctx, range: DateRange & { propertyId?: 
     collected,
     collectedOfExpected,
     collectionRate: expected > 0 ? Math.round((collectedOfExpected / expected) * 1000) / 10 : 0,
-    gstBilled: Number(billed.gst_billed),
-    gstCollected: round2(Number(gstRows[0]?.gst ?? 0)),
-    outstanding: Number(dues.outstanding),
-    overdue: Number(dues.overdue),
+    gstBilled: round2(billed.gst_billed ?? 0),
+    gstCollected: round2(gstRow?.gst ?? 0),
+    outstanding: round2(dues.outstanding ?? 0),
+    overdue: round2(dues.overdue ?? 0),
     expenses,
     depositDeductions,
     netIncome: round2(collected + depositDeductions - expenses),
-    depositsHeld: Number(deposits?.held ?? 0),
-    entries: Number(billed.entries),
+    depositsHeld: round2(deposits.held ?? 0),
+    entries: billed.entries ?? 0,
   };
 }
 
 export async function collectionsReport(ctx: Ctx, range: DateRange & { groupBy: 'month' | 'year'; propertyId?: string }) {
   assertRange(range);
   await ensureAccountCharges(ctx.accountId, ctx.today);
-  const fmt = range.groupBy === 'year' ? 'YYYY' : 'YYYY-MM';
+  const width = range.groupBy === 'year' ? 4 : 7;
+  const bucketOf = (field: string) => ({ $substrBytes: [field, 0, width] });
+  const unitIds = range.propertyId ? await unitIdsOfProperty(ctx, range.propertyId) : null;
 
-  const expectedRows = await db('rent_charges as c')
-    .join('units as u', 'u.id', 'c.unit_id')
-    .leftJoin(allocationTotals(db, ctx.accountId).as('al'), 'al.charge_id', 'c.id')
-    .where('c.account_id', ctx.accountId)
-    .whereNull('c.voided_at')
-    .whereNot('c.kind', 'opening_balance')
-    .whereBetween('c.due_date', [range.from, range.to])
-    .modify((q) => {
-      if (range.propertyId) q.where('u.property_id', range.propertyId);
-    })
-    .select(db.raw(`to_char(c.due_date, '${fmt}') AS bucket`))
-    .select(db.raw('SUM(c.total_amount) AS expected'))
-    .select(db.raw('SUM(COALESCE(al.paid, 0)) AS collected_of_expected'))
-    .groupByRaw(`to_char(c.due_date, '${fmt}')`);
+  const expectedRows = await col('rent_charges')
+    .aggregate([
+      ...chargeStatusStages({ accountId: ctx.accountId }, ctx.today, {
+        voided_at: null,
+        kind: { $ne: 'opening_balance' },
+        due_date: { $gte: range.from, $lte: range.to },
+        ...(unitIds ? { unit_id: { $in: unitIds } } : {}),
+      }),
+      { $group: { _id: bucketOf('$due_date'), expected: { $sum: '$total_amount' }, collected_of_expected: { $sum: '$paid_amount' } } },
+    ])
+    .toArray();
 
   let cashRows: Array<{ bucket: string; collected: number }>;
-  if (range.propertyId) {
-    const { rows } = await db.raw<{ rows: Array<{ bucket: string; collected: number }> }>(
-      `WITH pay AS (
-         SELECT p.id, p.amount, p.paid_on, p.unit_id FROM payments p
-          WHERE p.account_id = ? AND p.status = 'confirmed' AND p.paid_on BETWEEN ?::date AND ?::date
-       )
-       SELECT bucket, SUM(amount) AS collected FROM (
-         SELECT to_char(pay.paid_on, '${fmt}') AS bucket, pa.amount
-           FROM pay JOIN payment_allocations pa ON pa.payment_id = pay.id
-           JOIN rent_charges c ON c.id = pa.charge_id JOIN units u ON u.id = c.unit_id
-          WHERE u.property_id = ?
-         UNION ALL
-         SELECT to_char(pay.paid_on, '${fmt}') AS bucket, pay.amount - COALESCE(x.allocated, 0)
-           FROM pay
-           LEFT JOIN (SELECT payment_id, SUM(amount) AS allocated FROM payment_allocations GROUP BY payment_id) x ON x.payment_id = pay.id
-           JOIN units u ON u.id = pay.unit_id
-          WHERE u.property_id = ? AND pay.amount - COALESCE(x.allocated, 0) > 0
-       ) t GROUP BY bucket`,
-      [ctx.accountId, range.from, range.to, range.propertyId, range.propertyId],
+  if (unitIds) {
+    // Money applied to the property's charges plus unapplied money paid for its units.
+    const payments = await col('payments')
+      .find({ account_id: ctx.accountId, status: 'confirmed', paid_on: { $gte: range.from, $lte: range.to } }, { projection: { amount: 1, paid_on: 1, unit_id: 1 } })
+      .toArray();
+    const allocations = await col('payment_allocations').find({ payment_id: { $in: payments.map((p) => p._id) } }).toArray();
+    const chargeUnits = new Map(
+      (await col('rent_charges').find({ _id: { $in: allocations.map((a) => a.charge_id) } }, { projection: { unit_id: 1 } }).toArray()).map((c) => [c._id, c.unit_id]),
     );
-    cashRows = rows;
+    const inProperty = new Set(unitIds);
+    const paidOn = new Map(payments.map((p) => [p._id, p.paid_on as string]));
+    const allocated = new Map<string, number>();
+    const buckets = new Map<string, number>();
+    const add = (bucket: string, amount: number) => buckets.set(bucket, round2((buckets.get(bucket) ?? 0) + amount));
+    for (const a of allocations) {
+      allocated.set(a.payment_id, round2((allocated.get(a.payment_id) ?? 0) + a.amount));
+      if (inProperty.has(chargeUnits.get(a.charge_id))) add(paidOn.get(a.payment_id)!.slice(0, width), a.amount);
+    }
+    for (const p of payments) {
+      const unapplied = round2(p.amount - (allocated.get(p._id) ?? 0));
+      if (unapplied > 0 && p.unit_id && inProperty.has(p.unit_id)) add(String(p.paid_on).slice(0, width), unapplied);
+    }
+    cashRows = [...buckets.entries()].map(([bucket, collected]) => ({ bucket, collected }));
   } else {
-    cashRows = (await db('payments')
-      .where({ account_id: ctx.accountId, status: 'confirmed' })
-      .whereBetween('paid_on', [range.from, range.to])
-      .select(db.raw(`to_char(paid_on, '${fmt}') AS bucket`))
-      .sum({ collected: 'amount' })
-      .groupByRaw(`to_char(paid_on, '${fmt}')`)) as any;
+    cashRows = (
+      await col('payments')
+        .aggregate([
+          { $match: { account_id: ctx.accountId, status: 'confirmed', paid_on: { $gte: range.from, $lte: range.to } } },
+          { $group: { _id: bucketOf('$paid_on'), collected: { $sum: '$amount' } } },
+        ])
+        .toArray()
+    ).map((r) => ({ bucket: r._id as string, collected: r.collected as number }));
   }
 
-  const expenseRows = await db('expenses as e')
-    .leftJoin('units as u', 'u.id', 'e.unit_id')
-    .where('e.account_id', ctx.accountId)
-    .whereBetween('e.expense_date', [range.from, range.to])
-    .modify((q) => {
-      if (range.propertyId) q.whereRaw('COALESCE(e.property_id, u.property_id) = ?', [range.propertyId]);
-    })
-    .select(db.raw(`to_char(e.expense_date, '${fmt}') AS bucket`))
-    .sum({ expenses: 'e.amount' })
-    .groupByRaw(`to_char(e.expense_date, '${fmt}')`);
+  const expenseRows = await col('expenses')
+    .aggregate([
+      { $match: { account_id: ctx.accountId, expense_date: { $gte: range.from, $lte: range.to } } },
+      ...(range.propertyId
+        ? [
+            { $lookup: { from: 'units', localField: 'unit_id', foreignField: '_id', pipeline: [{ $project: { property_id: 1 } }], as: '_u' } },
+            { $match: { $expr: { $eq: [{ $ifNull: ['$property_id', { $first: '$_u.property_id' }] }, range.propertyId] } } },
+          ]
+        : []),
+      { $group: { _id: bucketOf('$expense_date'), expenses: { $sum: '$amount' } } },
+    ])
+    .toArray();
 
   const buckets =
     range.groupBy === 'year'
@@ -192,14 +218,14 @@ export async function collectionsReport(ctx: Ctx, range: DateRange & { groupBy: 
         )
       : monthKeysBetween(monthKeyOf(range.from), monthKeyOf(range.to));
 
-  const exp = new Map<string, any>(expectedRows.map((r: any) => [r.bucket as string, r]));
-  const cash = new Map<string, number>(cashRows.map((r: any) => [r.bucket as string, Number(r.collected)]));
-  const out = new Map<string, number>(expenseRows.map((r: any) => [r.bucket as string, Number(r.expenses)]));
+  const exp = new Map<string, any>(expectedRows.map((r) => [r._id as string, r]));
+  const cash = new Map<string, number>(cashRows.map((r) => [r.bucket, round2(r.collected)]));
+  const out = new Map<string, number>(expenseRows.map((r) => [r._id as string, round2(r.expenses)]));
 
   const series = buckets.map((bucket) => {
     const e = exp.get(bucket) as any;
-    const expected = Number(e?.expected ?? 0);
-    const collectedOfExpected = Number(e?.collected_of_expected ?? 0);
+    const expected = round2(e?.expected ?? 0);
+    const collectedOfExpected = round2(e?.collected_of_expected ?? 0);
     const collected = cash.get(bucket) ?? 0;
     const expenses = out.get(bucket) ?? 0;
     return {
@@ -232,20 +258,20 @@ export async function collectionsReport(ctx: Ctx, range: DateRange & { groupBy: 
 
 export async function pendingReport(ctx: Ctx, opts: { propertyId?: string; search?: string }) {
   await ensureAccountCharges(ctx.accountId, ctx.today);
-  const rows = await db
-    .from(
-      chargeQuery(db, { accountId: ctx.accountId }, ctx.today)
-        .modify((q) => {
-          if (opts.propertyId) q.where('p.id', opts.propertyId);
-          if (opts.search) {
-            const pattern = likePattern(opts.search);
-            q.where((w) => w.whereILike('t.name', pattern).orWhereILike('u.name', pattern));
-          }
-        })
-        .as('x'),
-    )
-    .whereIn('x.status', ['overdue', 'pending', 'to_confirm'])
-    .orderBy('x.due_date');
+  const pipeline: Document[] = [
+    ...chargeStatusStages({ accountId: ctx.accountId }, ctx.today, {
+      voided_at: null,
+      ...(opts.propertyId ? { unit_id: { $in: await unitIdsOfProperty(ctx, opts.propertyId) } } : {}),
+    }),
+    { $match: { status: { $in: ['overdue', 'pending', 'to_confirm'] } } },
+    ...chargeRefStages(),
+  ];
+  if (opts.search) {
+    const pattern = contains(opts.search);
+    pipeline.push({ $match: { $or: [{ tenant_name: pattern }, { unit_name: pattern }] } });
+  }
+  pipeline.push({ $sort: { due_date: 1 } });
+  const rows = await col('rent_charges').aggregate(pipeline).toArray();
 
   type Buckets = { current: number; d1_30: number; d31_60: number; d61_90: number; d90_plus: number };
   const emptyBuckets = (): Buckets => ({ current: 0, d1_30: 0, d31_60: 0, d61_90: 0, d90_plus: 0 });
@@ -307,34 +333,41 @@ export async function pendingReport(ctx: Ctx, opts: { propertyId?: string; searc
 export async function propertyIncomeReport(ctx: Ctx, range: DateRange) {
   assertRange(range);
   await ensureAccountCharges(ctx.accountId, ctx.today);
-  const [properties, expected, collected, expenses, dues, units] = await Promise.all([
-    db('properties').where({ account_id: ctx.accountId }).orderByRaw('archived_at IS NOT NULL, lower(name)'),
-    expectedByProperty(db, ctx.accountId, range.from, range.to),
-    collectedByProperty(db, ctx.accountId, range.from, range.to),
-    expensesByProperty(db, ctx.accountId, range.from, range.to),
-    duesByProperty(db, ctx.accountId, ctx.today),
-    db
-      .from(unitsWithOccupancy(db, ctx.accountId, ctx.today).whereNull('u.archived_at').as('x'))
-      .select('x.property_id')
-      .select(db.raw('COUNT(*) AS units'), db.raw(`COUNT(*) FILTER (WHERE x.occupancy = 'occupied') AS occupied`))
-      .groupBy('x.property_id'),
+  const [properties, expected, collected, expenses, dues, unitRows] = await Promise.all([
+    col('properties').find({ account_id: ctx.accountId }).toArray(),
+    expectedByProperty(ctx.accountId, range.from, range.to),
+    collectedByProperty(ctx.accountId, range.from, range.to),
+    expensesByProperty(ctx.accountId, range.from, range.to),
+    duesByProperty(ctx.accountId, ctx.today),
+    unitsWithOccupancy(ctx.accountId, ctx.today, { archived_at: null }),
   ]);
-  const unitMap = new Map(units.map((u: any) => [u.property_id, u]));
+  properties.sort(
+    (a, b) =>
+      Number(Boolean(a.archived_at)) - Number(Boolean(b.archived_at)) ||
+      String(a.name).localeCompare(String(b.name), 'en', { sensitivity: 'base', numeric: true }),
+  );
+  const unitMap = new Map<string, { units: number; occupied: number }>();
+  for (const u of unitRows) {
+    const current = unitMap.get(u.property_id) ?? { units: 0, occupied: 0 };
+    current.units += 1;
+    if (u.occupancy === 'occupied') current.occupied += 1;
+    unitMap.set(u.property_id, current);
+  }
 
   const items = properties
     .map((p) => {
-      const c = collected.get(p.id) ?? 0;
-      const e = expenses.get(p.id) ?? 0;
-      const u = unitMap.get(p.id) as any;
+      const c = collected.get(p._id) ?? 0;
+      const e = expenses.get(p._id) ?? 0;
+      const u = unitMap.get(p._id);
       return {
-        property: { id: p.id, name: p.name, type: p.type, archived: p.archived_at !== null },
+        property: { id: p._id, name: p.name, type: p.type, archived: p.archived_at !== null && p.archived_at !== undefined },
         units: Number(u?.units ?? 0),
         occupied: Number(u?.occupied ?? 0),
-        expected: expected.get(p.id) ?? 0,
+        expected: expected.get(p._id) ?? 0,
         collected: c,
         expenses: e,
         net: round2(c - e),
-        outstanding: dues.get(p.id)?.outstanding ?? 0,
+        outstanding: dues.get(p._id)?.outstanding ?? 0,
       };
     })
     .filter((i) => !i.property.archived || i.collected || i.expenses || i.expected);
@@ -359,48 +392,46 @@ export async function propertyIncomeReport(ctx: Ctx, range: DateRange) {
 
 export async function expenseReport(ctx: Ctx, range: DateRange & { propertyId?: string }) {
   assertRange(range);
-  const base = db('expenses as e')
-    .leftJoin('units as u', 'u.id', 'e.unit_id')
-    .leftJoin('properties as p', 'p.id', db.raw('COALESCE(e.property_id, u.property_id)'))
-    .where('e.account_id', ctx.accountId)
-    .whereBetween('e.expense_date', [range.from, range.to])
-    .modify((q) => {
-      if (range.propertyId) q.where('p.id', range.propertyId);
-    });
+  const base: Document[] = [
+    { $match: { account_id: ctx.accountId, expense_date: { $gte: range.from, $lte: range.to } } },
+    { $lookup: { from: 'units', localField: 'unit_id', foreignField: '_id', pipeline: [{ $project: { property_id: 1 } }], as: '_u' } },
+    { $addFields: { _pid: { $ifNull: ['$property_id', { $first: '$_u.property_id' }] } } },
+    { $lookup: { from: 'properties', localField: '_pid', foreignField: '_id', pipeline: [{ $project: { name: 1 } }], as: '_p' } },
+    { $addFields: { _p: { $first: '$_p' } } },
+    ...(range.propertyId ? [{ $match: { '_p._id': range.propertyId } }] : []),
+  ];
 
-  const [byCategory, byProperty, byMonth] = await Promise.all([
-    base.clone().select('e.category').sum({ amount: 'e.amount' }).count({ count: '*' }).groupBy('e.category').orderBy('amount', 'desc'),
-    base
-      .clone()
-      .select('p.id', 'p.name')
-      .sum({ amount: 'e.amount' })
-      .count({ count: '*' })
-      .groupBy('p.id', 'p.name')
-      .orderBy('amount', 'desc'),
-    base
-      .clone()
-      .select(db.raw(`to_char(e.expense_date, 'YYYY-MM') AS month`))
-      .sum({ amount: 'e.amount' })
-      .groupByRaw(`to_char(e.expense_date, 'YYYY-MM')`),
-  ]);
-  const monthMap = new Map(byMonth.map((r: any) => [r.month, Number(r.amount)]));
-  const total = round2(byCategory.reduce((s: number, r: any) => s + Number(r.amount), 0));
+  const [result] = await col('expenses')
+    .aggregate([
+      ...base,
+      {
+        $facet: {
+          byCategory: [{ $group: { _id: '$category', amount: { $sum: '$amount' }, count: { $sum: 1 } } }, { $sort: { amount: -1 } }],
+          byProperty: [{ $group: { _id: { id: '$_p._id', name: '$_p.name' }, amount: { $sum: '$amount' }, count: { $sum: 1 } } }, { $sort: { amount: -1 } }],
+          byMonth: [{ $group: { _id: { $substrBytes: ['$expense_date', 0, 7] }, amount: { $sum: '$amount' } } }],
+        },
+      },
+    ])
+    .toArray();
+  const byCategory = result.byCategory as Array<{ _id: ExpenseCategory; amount: number; count: number }>;
+  const monthMap = new Map((result.byMonth as Array<{ _id: string; amount: number }>).map((r) => [r._id, round2(r.amount)]));
+  const total = round2(byCategory.reduce((s, r) => s + r.amount, 0));
 
   return {
     from: range.from,
     to: range.to,
     total,
-    byCategory: byCategory.map((r: any) => ({
-      category: r.category,
-      label: EXPENSE_CATEGORY_LABELS[r.category as ExpenseCategory] ?? r.category,
-      amount: Number(r.amount),
-      count: Number(r.count),
-      share: total ? Math.round((Number(r.amount) / total) * 1000) / 10 : 0,
+    byCategory: byCategory.map((r) => ({
+      category: r._id,
+      label: EXPENSE_CATEGORY_LABELS[r._id] ?? r._id,
+      amount: round2(r.amount),
+      count: r.count,
+      share: total ? Math.round((r.amount / total) * 1000) / 10 : 0,
     })),
-    byProperty: byProperty.map((r: any) => ({
-      property: r.id ? { id: r.id, name: r.name } : null,
-      amount: Number(r.amount),
-      count: Number(r.count),
+    byProperty: (result.byProperty as Array<{ _id: { id?: string; name?: string }; amount: number; count: number }>).map((r) => ({
+      property: r._id.id ? { id: r._id.id, name: r._id.name } : null,
+      amount: round2(r.amount),
+      count: r.count,
     })),
     byMonth: monthKeysBetween(monthKeyOf(range.from), monthKeyOf(range.to)).map((m) => ({
       month: m,
@@ -413,71 +444,67 @@ export async function expenseReport(ctx: Ctx, range: DateRange & { propertyId?: 
 export async function tenantHistoryReport(ctx: Ctx, range: DateRange & { search?: string; page: number; pageSize: number }) {
   assertRange(range);
   await ensureAccountCharges(ctx.accountId, ctx.today);
-  const base = db('tenants as t')
-    .where('t.account_id', ctx.accountId)
-    .modify((q) => {
-      if (range.search) {
-        const pattern = likePattern(range.search);
-        q.where((w) => w.whereILike('t.name', pattern).orWhereILike('t.business_name', pattern).orWhere('t.phone', 'like', `%${range.search!.replace(/\D/g, '') || '~'}%`));
-      }
-    })
-    .whereExists(db('agreements as a').whereRaw('a.tenant_id = t.id'));
+  const withAgreements = await col('agreements').distinct('tenant_id', { account_id: ctx.accountId });
+  const filter: Document = { account_id: ctx.accountId, _id: { $in: withAgreements } };
+  if (range.search) {
+    const pattern = contains(range.search);
+    const digits = range.search.replace(/\D/g, '');
+    filter.$or = [{ name: pattern }, { business_name: pattern }, ...(digits ? [{ phone: { $regex: escapeRegex(digits) } }] : [])];
+  }
 
-  const [{ count }] = await base.clone().count<{ count: number }[]>({ count: '*' });
-  const tenants = await base
-    .clone()
-    .select('t.id', 't.name', 't.phone', 't.business_name', 't.archived_at')
-    .orderByRaw('lower(t.name), t.id')
+  const total = await col('tenants').countDocuments(filter);
+  const tenants = await col('tenants')
+    .find(filter)
+    .collation({ locale: 'en', strength: 2 })
+    .sort({ name: 1, _id: 1 })
+    .skip((range.page - 1) * range.pageSize)
     .limit(range.pageSize)
-    .offset((range.page - 1) * range.pageSize);
-  const ids = tenants.map((t: Record<string, any>) => t.id as string);
-  if (ids.length === 0) return { from: range.from, to: range.to, items: [], total: Number(count) };
+    .toArray();
+  const ids = tenants.map((t) => t._id);
+  if (ids.length === 0) return { from: range.from, to: range.to, items: [], total };
 
-  const billed = await db('rent_charges')
-    .whereIn('tenant_id', ids)
-    .whereNull('voided_at')
-    .whereBetween('due_date', [range.from, range.to])
-    .select('tenant_id')
-    .sum({ amount: 'total_amount' })
-    .groupBy('tenant_id');
-  const paid = await db('payments')
-    .whereIn('tenant_id', ids)
-    .where('status', 'confirmed')
-    .whereBetween('paid_on', [range.from, range.to])
-    .select('tenant_id')
-    .sum({ amount: 'amount' })
-    .count({ count: '*' })
-    .groupBy('tenant_id');
-  const balances = await db('rent_charges as c')
-    .leftJoin(allocationTotals(db, ctx.accountId).as('al'), 'al.charge_id', 'c.id')
-    .whereIn('c.tenant_id', ids)
-    .whereNull('c.voided_at')
-    .select('c.tenant_id')
-    .select(db.raw('SUM(c.total_amount - COALESCE(al.paid, 0)) AS outstanding'))
-    .groupBy('c.tenant_id');
-  const units = await db('agreements as a')
-    .join('units as u', 'u.id', 'a.unit_id')
-    .whereIn('a.tenant_id', ids)
-    .select('a.tenant_id', 'u.name', 'a.status', 'a.start_date', 'a.ended_on')
-    .orderBy('a.start_date', 'desc');
+  const [billed, paid, balances, agreements] = await Promise.all([
+    col('rent_charges')
+      .aggregate([
+        { $match: { tenant_id: { $in: ids }, voided_at: null, due_date: { $gte: range.from, $lte: range.to } } },
+        { $group: { _id: '$tenant_id', amount: { $sum: '$total_amount' } } },
+      ])
+      .toArray(),
+    col('payments')
+      .aggregate([
+        { $match: { tenant_id: { $in: ids }, status: 'confirmed', paid_on: { $gte: range.from, $lte: range.to } } },
+        { $group: { _id: '$tenant_id', amount: { $sum: '$amount' }, count: { $sum: 1 } } },
+      ])
+      .toArray(),
+    col('rent_charges')
+      .aggregate([
+        ...chargeStatusStages({ accountId: ctx.accountId }, ctx.today, { tenant_id: { $in: ids }, voided_at: null }),
+        { $group: { _id: '$tenant_id', outstanding: { $sum: '$balance' } } },
+      ])
+      .toArray(),
+    col('agreements').find({ tenant_id: { $in: ids } }).sort({ start_date: -1 }).toArray(),
+  ]);
+  const unitNames = new Map(
+    (await col('units').find({ _id: { $in: agreements.map((a) => a.unit_id) } }, { projection: { name: 1 } }).toArray()).map((u) => [u._id, u.name]),
+  );
 
-  const billedMap = new Map(billed.map((r: any) => [r.tenant_id, Number(r.amount)]));
-  const paidMap = new Map(paid.map((r: any) => [r.tenant_id, { amount: Number(r.amount), count: Number(r.count) }]));
-  const balanceMap = new Map(balances.map((r: any) => [r.tenant_id, Number(r.outstanding)]));
+  const billedMap = new Map(billed.map((r) => [r._id, round2(r.amount)]));
+  const paidMap = new Map(paid.map((r) => [r._id, { amount: round2(r.amount), count: r.count as number }]));
+  const balanceMap = new Map(balances.map((r) => [r._id, round2(r.outstanding)]));
 
   return {
     from: range.from,
     to: range.to,
-    total: Number(count),
-    items: tenants.map((t: Record<string, any>) => ({
-      tenant: { id: t.id, name: t.name, phone: t.phone, businessName: t.business_name, archived: t.archived_at !== null },
-      units: units
-        .filter((u) => u.tenant_id === t.id)
-        .map((u) => ({ name: u.name, status: u.status, startDate: u.start_date, endedOn: u.ended_on })),
-      billed: billedMap.get(t.id) ?? 0,
-      paid: paidMap.get(t.id)?.amount ?? 0,
-      payments: paidMap.get(t.id)?.count ?? 0,
-      outstanding: Math.max(0, balanceMap.get(t.id) ?? 0),
+    total,
+    items: tenants.map((t) => ({
+      tenant: { id: t._id, name: t.name, phone: t.phone, businessName: t.business_name ?? null, archived: Boolean(t.archived_at) },
+      units: agreements
+        .filter((a) => a.tenant_id === t._id)
+        .map((a) => ({ name: unitNames.get(a.unit_id), status: a.status, startDate: a.start_date, endedOn: a.ended_on ?? null })),
+      billed: billedMap.get(t._id) ?? 0,
+      paid: paidMap.get(t._id)?.amount ?? 0,
+      payments: paidMap.get(t._id)?.count ?? 0,
+      outstanding: Math.max(0, balanceMap.get(t._id) ?? 0),
     })),
   };
 }

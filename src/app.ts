@@ -5,7 +5,7 @@ import helmet from 'helmet';
 import { pinoHttp } from 'pino-http';
 import { config } from './config/env.js';
 import { logger } from './config/logger.js';
-import { db } from './db/knex.js';
+import { getDb } from './db/mongo.js';
 import { errorHandler, notFoundHandler } from './middleware/error-handler.js';
 import { apiLimiter } from './middleware/rate-limit.js';
 import { apiRouter } from './routes.js';
@@ -71,7 +71,7 @@ export function createApp(): Express {
   // Readiness: dependencies are reachable.
   app.get('/ready', async (_req, res) => {
     try {
-      await db.raw('SELECT 1');
+      await getDb().command({ ping: 1 });
       res.json({ success: true, data: { status: 'ready', database: 'up' } });
     } catch {
       res.status(503).json({ success: false, error: { code: 'SERVICE_UNAVAILABLE', message: 'Database unavailable' } });

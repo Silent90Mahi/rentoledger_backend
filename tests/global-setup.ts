@@ -1,42 +1,28 @@
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { TestProject } from 'vitest/node';
-import knex from 'knex';
-import { startEmbeddedPostgres, type EmbeddedDatabase } from '../scripts/embedded-postgres.js';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 
 declare module 'vitest' {
   export interface ProvidedContext {
-    databaseUrl: string;
+    mongoUri: string;
   }
 }
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-let database: EmbeddedDatabase | null = null;
+let server: MongoMemoryReplSet | null = null;
 
 /**
- * Starts (or reuses) a PostgreSQL server for the test run. Set
- * TEST_DATABASE_URL to run the suite against an existing server instead.
+ * Starts a throwaway single-node MongoDB replica set (in memory) for the test
+ * run. Set TEST_MONGODB_URI to run the suite against an existing replica set
+ * instead (its `rentoledger_test` database is dropped by the tests).
  */
 export async function setup(project: TestProject): Promise<void> {
-  let url = process.env.TEST_DATABASE_URL;
-  if (!url) {
-    database = await startEmbeddedPostgres({
-      dataDir: path.join(root, '.data', 'postgres-test'),
-      port: Number(process.env.TEST_PG_PORT ?? 54330),
-      database: 'rentoledger_test',
-      log: () => undefined,
-    });
-    url = database.url;
+  let uri = process.env.TEST_MONGODB_URI;
+  if (!uri) {
+    server = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } });
+    uri = server.getUri();
   }
-
-  // Start every run from an empty schema.
-  const admin = knex({ client: 'pg', connection: url });
-  await admin.raw('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
-  await admin.destroy();
-
-  project.provide('databaseUrl', url);
+  project.provide('mongoUri', uri);
 }
 
 export async function teardown(): Promise<void> {
-  if (database?.owned) await database.stop();
+  if (server) await server.stop();
 }

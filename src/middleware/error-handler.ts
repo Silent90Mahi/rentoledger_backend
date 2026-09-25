@@ -1,7 +1,8 @@
 import type { NextFunction, Request, Response } from 'express';
 import { ZodError } from 'zod';
 import { config } from '../config/env.js';
-import { AppError, isPgError, PG_ERRORS, type ErrorCode, type ErrorDetail } from '../lib/errors.js';
+import { isDuplicateKey } from '../db/indexes.js';
+import { AppError, type ErrorCode, type ErrorDetail } from '../lib/errors.js';
 
 interface ErrorBody {
   success: false;
@@ -53,27 +54,16 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     return;
   }
 
-  if (isPgError(err)) {
-    switch (err.code) {
-      case PG_ERRORS.UNIQUE_VIOLATION:
-        send(res, 409, 'CONFLICT', 'A record with the same details already exists.');
-        return;
-      case PG_ERRORS.FOREIGN_KEY_VIOLATION:
-        send(res, 409, 'CONFLICT', 'This record is linked to other records and cannot be changed this way.');
-        return;
-      case PG_ERRORS.CHECK_VIOLATION:
-      case PG_ERRORS.NOT_NULL_VIOLATION:
-      case PG_ERRORS.INVALID_TEXT_REPRESENTATION:
-      case PG_ERRORS.INVALID_DATETIME:
-      case PG_ERRORS.DATETIME_OVERFLOW:
-      case PG_ERRORS.NUMERIC_OUT_OF_RANGE:
-      case PG_ERRORS.STRING_TOO_LONG:
-        req.log?.warn({ err }, 'Database rejected input');
-        send(res, 400, 'VALIDATION_ERROR', 'Some values are invalid or out of range.');
-        return;
-      default:
-        break;
-    }
+  // A unique index rejected the write (e.g. two requests creating the same record at once).
+  if (isDuplicateKey(err)) {
+    send(res, 409, 'CONFLICT', 'A record with the same details already exists.');
+    return;
+  }
+  const mongoErr = err as { name?: string; code?: number };
+  if (mongoErr?.name === 'MongoServerSelectionError' || mongoErr?.name === 'MongoNetworkError') {
+    req.log?.error({ err }, 'Database unavailable');
+    send(res, 503, 'SERVICE_UNAVAILABLE', 'Service temporarily unavailable. Please try again shortly.');
+    return;
   }
 
   const status = httpErr?.status ?? httpErr?.statusCode;

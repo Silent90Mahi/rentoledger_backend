@@ -1,9 +1,11 @@
-import { db } from '../../db/knex.js';
+import { isDuplicateKey, keys } from '../../db/indexes.js';
+import { col, contains, newId, withTransaction, type Doc } from '../../db/mongo.js';
+import type { Filter } from 'mongodb';
 import type { Ctx } from '../../lib/context.js';
 import { startOfMonth, endOfMonth, addMonths, addDays } from '../../lib/dates.js';
-import { Errors, isPgError, PG_ERRORS } from '../../lib/errors.js';
+import { Errors } from '../../lib/errors.js';
 import { round2 } from '../../lib/money.js';
-import { likePattern, resolveSort } from '../../lib/validation.js';
+import { resolveSort } from '../../lib/validation.js';
 import { logActivity } from '../activity/activity.service.js';
 import { collectedByProperty, duesByProperty, expectedByProperty, expensesByProperty } from '../finance/finance.queries.js';
 import { mapUnit, unitsWithOccupancy, type UnitDto } from '../units/occupancy.js';
@@ -65,7 +67,7 @@ function emptyStats(): PropertyStats {
 
 function mapProperty(r: Record<string, any>, stats: PropertyStats): PropertyDto {
   return {
-    id: r.id,
+    id: r._id ?? r.id,
     name: r.name,
     type: r.type,
     addressLine: r.address_line ?? null,
@@ -73,7 +75,7 @@ function mapProperty(r: Record<string, any>, stats: PropertyStats): PropertyDto 
     state: r.state ?? null,
     pincode: r.pincode ?? null,
     notes: r.notes ?? null,
-    archived: r.archived_at !== null,
+    archived: r.archived_at !== null && r.archived_at !== undefined,
     stats,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -84,9 +86,7 @@ async function statsFor(ctx: Ctx, propertyIds: string[]): Promise<Map<string, Pr
   const map = new Map<string, PropertyStats>(propertyIds.map((id) => [id, emptyStats()]));
   if (propertyIds.length === 0) return map;
 
-  const units = await unitsWithOccupancy(db, ctx.accountId, ctx.today)
-    .whereIn('u.property_id', propertyIds)
-    .whereNull('u.archived_at');
+  const units = await unitsWithOccupancy(ctx.accountId, ctx.today, { property_id: { $in: propertyIds }, archived_at: null });
   for (const row of units) {
     const unit = mapUnit(row, ctx.today);
     const s = map.get(unit.property.id)!;
@@ -98,7 +98,7 @@ async function statsFor(ctx: Ctx, propertyIds: string[]): Promise<Map<string, Pr
     else s.vacant += 1;
   }
 
-  const dues = await duesByProperty(db, ctx.accountId, ctx.today);
+  const dues = await duesByProperty(ctx.accountId, ctx.today);
   for (const [id, s] of map) {
     s.occupancyRate = s.units ? Math.round((s.occupied / s.units) * 1000) / 10 : 0;
     const d = dues.get(id);
@@ -116,46 +116,35 @@ export async function listProperties(
 ): Promise<{ items: PropertyDto[]; total: number }> {
   const sort = resolveSort(
     opts.sort,
-    { name: 'p.name', createdAt: 'p.created_at', updatedAt: 'p.updated_at', type: 'p.type', city: 'p.city' },
-    { column: 'p.name', direction: 'asc' },
+    { name: 'name', createdAt: 'created_at', updatedAt: 'updated_at', type: 'type', city: 'city' },
+    { column: 'name', direction: 'asc' },
   );
 
-  const base = db('properties as p')
-    .where('p.account_id', ctx.accountId)
-    .modify((q) => {
-      if (opts.archived) q.whereNotNull('p.archived_at');
-      else q.whereNull('p.archived_at');
-      if (opts.type) q.where('p.type', opts.type);
-      if (opts.search) {
-        const pattern = likePattern(opts.search);
-        q.where((w) =>
-          w
-            .whereILike('p.name', pattern)
-            .orWhereILike('p.city', pattern)
-            .orWhereILike('p.address_line', pattern)
-            .orWhereExists(
-              db('units as su')
-                .whereRaw('su.property_id = p.id')
-                .whereNull('su.archived_at')
-                .whereILike('su.name', pattern),
-            ),
-        );
-      }
-    });
+  const filter: Filter<Doc> = { account_id: ctx.accountId, archived_at: opts.archived ? { $ne: null } : null };
+  if (opts.type) filter.type = opts.type;
+  if (opts.search) {
+    const pattern = contains(opts.search);
+    const withUnit = await col('units').distinct('property_id', { account_id: ctx.accountId, archived_at: null, name: pattern });
+    filter.$or = [{ name: pattern }, { city: pattern }, { address_line: pattern }, { _id: { $in: withUnit } }];
+  }
 
-  const [{ count }] = await base.clone().count<{ count: number }[]>({ count: '*' });
-  const rows = await base
-    .clone()
-    .select('p.*')
-    .orderByRaw(`${sort.column === 'p.name' ? 'lower(p.name)' : sort.column} ${sort.direction}, p.id`)
-    .limit(opts.pageSize)
-    .offset((opts.page - 1) * opts.pageSize);
-  const stats = await statsFor(ctx, rows.map((r: Record<string, any>) => r.id as string));
-  return { total: Number(count), items: rows.map((r: Record<string, any>) => mapProperty(r, stats.get(r.id)!)) };
+  const direction = sort.direction === 'asc' ? 1 : -1;
+  const [total, rows] = await Promise.all([
+    col('properties').countDocuments(filter),
+    col('properties')
+      .find(filter)
+      .collation({ locale: 'en', strength: 2 })
+      .sort({ [sort.column]: direction, _id: 1 })
+      .skip((opts.page - 1) * opts.pageSize)
+      .limit(opts.pageSize)
+      .toArray(),
+  ]);
+  const stats = await statsFor(ctx, rows.map((r) => r._id));
+  return { total, items: rows.map((r) => mapProperty(r, stats.get(r._id)!)) };
 }
 
 async function findProperty(ctx: Ctx, id: string) {
-  const row = await db('properties').where({ id, account_id: ctx.accountId }).first();
+  const row = await col('properties').findOne({ _id: id, account_id: ctx.accountId });
   if (!row) throw Errors.notFound('Property');
   return row;
 }
@@ -171,19 +160,19 @@ export interface PropertyDetailDto extends PropertyDto {
 export async function getProperty(ctx: Ctx, id: string): Promise<PropertyDetailDto> {
   const row = await findProperty(ctx, id);
   const stats = (await statsFor(ctx, [id])).get(id)!;
-  const unitRows = await unitsWithOccupancy(db, ctx.accountId, ctx.today)
-    .where('u.property_id', id)
-    .orderByRaw('u.archived_at IS NOT NULL, lower(u.name)');
+  const unitRows = (await unitsWithOccupancy(ctx.accountId, ctx.today, { property_id: id })).sort(
+    (a, b) => Number(a.archived_at !== null) - Number(b.archived_at !== null) || String(a.name).localeCompare(String(b.name), 'en', { sensitivity: 'base', numeric: true }),
+  );
 
   const monthFrom = startOfMonth(ctx.today);
   const monthTo = endOfMonth(ctx.today);
   const yearFrom = addDays(addMonths(ctx.today, -12), 1);
   const [expMonth, colMonth, expenseMonth, colYear, expenseYear] = await Promise.all([
-    expectedByProperty(db, ctx.accountId, monthFrom, monthTo),
-    collectedByProperty(db, ctx.accountId, monthFrom, monthTo),
-    expensesByProperty(db, ctx.accountId, monthFrom, monthTo),
-    collectedByProperty(db, ctx.accountId, yearFrom, ctx.today),
-    expensesByProperty(db, ctx.accountId, yearFrom, ctx.today),
+    expectedByProperty(ctx.accountId, monthFrom, monthTo),
+    collectedByProperty(ctx.accountId, monthFrom, monthTo),
+    expensesByProperty(ctx.accountId, monthFrom, monthTo),
+    collectedByProperty(ctx.accountId, yearFrom, ctx.today),
+    expensesByProperty(ctx.accountId, yearFrom, ctx.today),
   ]);
 
   const collectedMonth = colMonth.get(id) ?? 0;
@@ -206,7 +195,7 @@ export async function getProperty(ctx: Ctx, id: string): Promise<PropertyDetailD
   };
 }
 
-function toRow(input: Partial<PropertyInput>) {
+function toFields(input: Partial<PropertyInput>) {
   const row: Record<string, unknown> = {};
   if (input.name !== undefined) row.name = input.name;
   if (input.type !== undefined) row.type = input.type;
@@ -219,10 +208,10 @@ function toRow(input: Partial<PropertyInput>) {
 }
 
 function translateUniqueError(error: unknown): never {
-  if (isPgError(error) && error.code === PG_ERRORS.UNIQUE_VIOLATION) {
-    if (error.constraint === 'units_property_name_key') {
-      throw Errors.conflict('A unit with this name already exists in the property.', [{ field: 'unitName', message: 'Already exists' }]);
-    }
+  if (isDuplicateKey(error, 'units_property_name_key')) {
+    throw Errors.conflict('A unit with this name already exists in the property.', [{ field: 'unitName', message: 'Already exists' }]);
+  }
+  if (isDuplicateKey(error)) {
     throw Errors.conflict('A property with this name already exists.', [{ field: 'name', message: 'Already exists' }]);
   }
   throw error;
@@ -234,27 +223,51 @@ export async function createProperty(
 ): Promise<PropertyDetailDto> {
   let id: string;
   try {
-    id = await db.transaction(async (trx) => {
-      const [row] = await trx('properties')
-        .insert({ ...toRow(input), account_id: ctx.accountId })
-        .returning(['id', 'name']);
+    id = await withTransaction(async (session) => {
+      const now = new Date();
+      const property = {
+        _id: newId(),
+        account_id: ctx.accountId,
+        address_line: null,
+        city: null,
+        state: null,
+        pincode: null,
+        notes: null,
+        ...toFields(input),
+        name_key: keys.name(input.name),
+        archived_at: null,
+        created_at: now,
+        updated_at: now,
+      };
+      await col('properties').insertOne(property as Doc, { session });
       if (input.singleUnit) {
-        await trx('units').insert({
-          account_id: ctx.accountId,
-          property_id: row.id,
-          name: input.singleUnit.name?.trim() || input.name,
-          type: input.singleUnit.type ?? DEFAULT_UNIT_TYPE[input.type],
-          default_rent: input.singleUnit.defaultRent ?? null,
-          area_sqft: input.singleUnit.areaSqft ?? null,
-        });
+        const unitName = input.singleUnit.name?.trim() || input.name;
+        await col('units').insertOne(
+          {
+            _id: newId(),
+            account_id: ctx.accountId,
+            property_id: property._id,
+            name: unitName,
+            name_key: keys.name(unitName),
+            type: input.singleUnit.type ?? DEFAULT_UNIT_TYPE[input.type],
+            floor: null,
+            default_rent: input.singleUnit.defaultRent ?? null,
+            area_sqft: input.singleUnit.areaSqft ?? null,
+            notes: null,
+            archived_at: null,
+            created_at: now,
+            updated_at: now,
+          },
+          { session },
+        );
       }
-      await logActivity(trx, ctx, {
+      await logActivity(session, ctx, {
         action: 'property.created',
         entityType: 'property',
-        entityId: row.id,
-        summary: `Added property ${row.name}`,
+        entityId: property._id,
+        summary: `Added property ${input.name}`,
       });
-      return row.id as string;
+      return property._id;
     });
   } catch (error) {
     translateUniqueError(error);
@@ -264,12 +277,13 @@ export async function createProperty(
 
 export async function updateProperty(ctx: Ctx, id: string, input: Partial<PropertyInput>): Promise<PropertyDetailDto> {
   const existing = await findProperty(ctx, id);
-  const changes = toRow(input);
+  const changes = toFields(input);
+  if (input.name !== undefined && !existing.archived_at) changes.name_key = keys.name(input.name);
   if (Object.keys(changes).length > 0) {
     try {
-      await db.transaction(async (trx) => {
-        await trx('properties').where({ id, account_id: ctx.accountId }).update(changes);
-        await logActivity(trx, ctx, {
+      await withTransaction(async (session) => {
+        await col('properties').updateOne({ _id: id, account_id: ctx.accountId }, { $set: { ...changes, updated_at: new Date() } }, { session });
+        await logActivity(session, ctx, {
           action: 'property.updated',
           entityType: 'property',
           entityId: id,
@@ -286,18 +300,19 @@ export async function updateProperty(ctx: Ctx, id: string, input: Partial<Proper
 export async function archiveProperty(ctx: Ctx, id: string): Promise<PropertyDetailDto> {
   const property = await findProperty(ctx, id);
   if (property.archived_at) return getProperty(ctx, id);
-  const active = await db('agreements as a')
-    .join('units as u', 'u.id', 'a.unit_id')
-    .where('u.property_id', id)
-    .where('a.status', 'active')
-    .first('a.id');
+  const unitIds = await col('units').distinct('_id', { property_id: id, account_id: ctx.accountId });
+  const active = await col('agreements').findOne({ account_id: ctx.accountId, unit_id: { $in: unitIds }, status: 'active' });
   if (active) throw Errors.conflict('End the active agreements of this property before archiving it.');
 
-  await db.transaction(async (trx) => {
+  await withTransaction(async (session) => {
     const archivedAt = new Date();
-    await trx('properties').where({ id }).update({ archived_at: archivedAt });
-    await trx('units').where({ property_id: id }).whereNull('archived_at').update({ archived_at: archivedAt });
-    await logActivity(trx, ctx, { action: 'property.archived', entityType: 'property', entityId: id, summary: `Archived property ${property.name}` });
+    await col('properties').updateOne({ _id: id }, { $set: { archived_at: archivedAt, updated_at: archivedAt }, $unset: { name_key: '' } }, { session });
+    await col('units').updateMany(
+      { property_id: id, archived_at: null },
+      { $set: { archived_at: archivedAt, updated_at: archivedAt }, $unset: { name_key: '' } },
+      { session },
+    );
+    await logActivity(session, ctx, { action: 'property.archived', entityType: 'property', entityId: id, summary: `Archived property ${property.name}` });
   });
   return getProperty(ctx, id);
 }
@@ -306,10 +321,22 @@ export async function restoreProperty(ctx: Ctx, id: string): Promise<PropertyDet
   const property = await findProperty(ctx, id);
   if (!property.archived_at) return getProperty(ctx, id);
   try {
-    await db.transaction(async (trx) => {
-      await trx('units').where({ property_id: id, archived_at: property.archived_at }).update({ archived_at: null });
-      await trx('properties').where({ id }).update({ archived_at: null });
-      await logActivity(trx, ctx, { action: 'property.restored', entityType: 'property', entityId: id, summary: `Restored property ${property.name}` });
+    await withTransaction(async (session) => {
+      // Units archived together with the property come back with it.
+      const units = await col('units').find({ property_id: id, archived_at: property.archived_at }, { session }).toArray();
+      for (const unit of units) {
+        await col('units').updateOne(
+          { _id: unit._id },
+          { $set: { archived_at: null, name_key: keys.name(unit.name), updated_at: new Date() } },
+          { session },
+        );
+      }
+      await col('properties').updateOne(
+        { _id: id },
+        { $set: { archived_at: null, name_key: keys.name(property.name), updated_at: new Date() } },
+        { session },
+      );
+      await logActivity(session, ctx, { action: 'property.restored', entityType: 'property', entityId: id, summary: `Restored property ${property.name}` });
     });
   } catch (error) {
     translateUniqueError(error);
@@ -319,18 +346,16 @@ export async function restoreProperty(ctx: Ctx, id: string): Promise<PropertyDet
 
 export async function deleteProperty(ctx: Ctx, id: string): Promise<void> {
   const property = await findProperty(ctx, id);
-  const history = await db('agreements as a')
-    .join('units as u', 'u.id', 'a.unit_id')
-    .where('u.property_id', id)
-    .first('a.id');
-  const expense = await db('expenses').where({ property_id: id }).first('id');
+  const unitIds = await col('units').distinct('_id', { property_id: id, account_id: ctx.accountId });
+  const history = await col('agreements').findOne({ account_id: ctx.accountId, unit_id: { $in: unitIds } });
+  const expense = await col('expenses').findOne({ account_id: ctx.accountId, property_id: id });
   if (history || expense) {
     throw Errors.conflict('This property has rental or expense history. Archive it instead of deleting.');
   }
-  await db.transaction(async (trx) => {
-    await trx('expenses').whereIn('unit_id', trx('units').select('id').where({ property_id: id })).update({ unit_id: null });
-    await trx('units').where({ property_id: id }).delete();
-    await trx('properties').where({ id, account_id: ctx.accountId }).delete();
-    await logActivity(trx, ctx, { action: 'property.deleted', entityType: 'property', entityId: id, summary: `Deleted property ${property.name}` });
+  await withTransaction(async (session) => {
+    await col('expenses').updateMany({ account_id: ctx.accountId, unit_id: { $in: unitIds } }, { $set: { unit_id: null } }, { session });
+    await col('units').deleteMany({ property_id: id, account_id: ctx.accountId }, { session });
+    await col('properties').deleteOne({ _id: id, account_id: ctx.accountId }, { session });
+    await logActivity(session, ctx, { action: 'property.deleted', entityType: 'property', entityId: id, summary: `Deleted property ${property.name}` });
   });
 }

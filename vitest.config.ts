@@ -6,7 +6,7 @@ export default defineConfig({
     globalSetup: ['./tests/global-setup.ts'],
     setupFiles: ['./tests/setup-env.ts'],
     include: ['tests/**/*.test.ts'],
-    // All suites share one PostgreSQL database, so run files one at a time.
+    // All suites share one MongoDB database, so run files one at a time.
     fileParallelism: false,
     maxWorkers: 1,
     testTimeout: 30_000,

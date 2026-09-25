@@ -1,7 +1,7 @@
 import request from 'supertest';
 import { createApp } from '../src/app.js';
-import { getDb } from '../src/db/knex.js';
-import { migrateLatest } from '../src/db/migrate.js';
+import { ensureIndexes } from '../src/db/indexes.js';
+import { COLLECTIONS, col } from '../src/db/mongo.js';
 import { setNowForTests } from '../src/lib/clock.js';
 import { resetGenerationThrottle } from '../src/modules/rents/generation.service.js';
 
@@ -9,18 +9,15 @@ export const app = createApp();
 export const api = () => request(app);
 export const V1 = '/api/v1';
 
-let migrated = false;
+let indexed = false;
 
-/** Empties every table (schema is migrated once per worker). */
+/** Empties every collection (indexes are created once per worker). */
 export async function resetDatabase(): Promise<void> {
-  const db = getDb();
-  if (!migrated) {
-    await migrateLatest(db);
-    migrated = true;
+  if (!indexed) {
+    await ensureIndexes();
+    indexed = true;
   }
-  await db.raw(`TRUNCATE users, accounts, account_members, otp_codes, refresh_tokens, properties, units, tenants,
-                agreements, rent_charges, payments, payment_allocations, deposit_transactions, expenses,
-                notifications, activity_logs RESTART IDENTITY CASCADE`);
+  await Promise.all(COLLECTIONS.map((name) => col(name).deleteMany({})));
   resetGenerationThrottle();
 }
 

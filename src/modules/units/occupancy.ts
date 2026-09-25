@@ -1,83 +1,100 @@
-import type { Knex } from 'knex';
+import type { Filter } from 'mongodb';
+import { col, opts, type Doc, type Session } from '../../db/mongo.js';
 import { CYCLE_MONTHS, periodContaining, type BillingCycle, type BillingTerms } from '../rents/billing.js';
 
 export type Occupancy = 'occupied' | 'vacant' | 'reserved';
 
 /**
- * Units joined with their current agreement (tenant in possession today)
- * and the next upcoming agreement (future move-in).
+ * Units (matching `filter`, always scoped to the account) with their current
+ * agreement (tenant in possession today) and the next upcoming agreement
+ * (future move-in). Rows use the field names the mapping code expects:
+ * unit fields, `property_*`, `ca_*` (current agreement), `ct_*` (its tenant),
+ * `ua_*` / `ut_*` (upcoming agreement/tenant) and `occupancy`.
  */
-export function unitsWithOccupancy(q: Knex | Knex.Transaction, accountId: string, today: string): Knex.QueryBuilder {
-  return q('units as u')
-    .join('properties as p', 'p.id', 'u.property_id')
-    .joinRaw(
-      `LEFT JOIN LATERAL (
-         SELECT a.id, a.tenant_id, a.rent_amount, a.billing_cycle, a.due_day, a.gst_applicable, a.gst_rate,
-                a.security_deposit, a.start_date, a.end_date, a.ended_on, a.status, a.billing_start_date,
-                a.escalation_percent, a.escalation_interval_months, a.escalation_base_date, a.prorate_partial_periods
-           FROM agreements a
-          WHERE a.unit_id = u.id
-            AND a.start_date <= ?::date
-            AND (a.status = 'active' OR a.ended_on >= ?::date)
-          ORDER BY a.start_date DESC
-          LIMIT 1
-       ) ca ON true`,
-      [today, today],
-    )
-    .joinRaw(
-      `LEFT JOIN LATERAL (
-         SELECT a.id, a.tenant_id, a.start_date, a.rent_amount, a.billing_cycle
-           FROM agreements a
-          WHERE a.unit_id = u.id AND a.status = 'active' AND a.start_date > ?::date
-          ORDER BY a.start_date ASC
-          LIMIT 1
-       ) ua ON true`,
-      [today],
-    )
-    .leftJoin('tenants as ct', 'ct.id', 'ca.tenant_id')
-    .leftJoin('tenants as ut', 'ut.id', 'ua.tenant_id')
-    .where('u.account_id', accountId)
-    .select(
-      'u.id',
-      'u.property_id',
-      'u.name',
-      'u.type',
-      'u.floor',
-      'u.area_sqft',
-      'u.default_rent',
-      'u.notes',
-      'u.archived_at',
-      'u.created_at',
-      'u.updated_at',
-      'p.name as property_name',
-      'p.type as property_type',
-      'ca.id as ca_id',
-      'ca.rent_amount as ca_rent_amount',
-      'ca.billing_cycle as ca_billing_cycle',
-      'ca.due_day as ca_due_day',
-      'ca.gst_applicable as ca_gst_applicable',
-      'ca.gst_rate as ca_gst_rate',
-      'ca.security_deposit as ca_security_deposit',
-      'ca.start_date as ca_start_date',
-      'ca.end_date as ca_end_date',
-      'ca.ended_on as ca_ended_on',
-      'ca.billing_start_date as ca_billing_start_date',
-      'ca.escalation_percent as ca_escalation_percent',
-      'ca.escalation_interval_months as ca_escalation_interval_months',
-      'ca.escalation_base_date as ca_escalation_base_date',
-      'ca.prorate_partial_periods as ca_prorate_partial_periods',
-      'ct.id as ct_id',
-      'ct.name as ct_name',
-      'ct.phone as ct_phone',
-      'ct.business_name as ct_business_name',
-      'ua.id as ua_id',
-      'ua.start_date as ua_start_date',
-      'ut.id as ut_id',
-      'ut.name as ut_name',
-      q.raw(
-        `CASE WHEN ca.id IS NOT NULL THEN 'occupied' WHEN ua.id IS NOT NULL THEN 'reserved' ELSE 'vacant' END AS occupancy`,
-      ),
-    );
+export async function unitsWithOccupancy(
+  accountId: string,
+  today: string,
+  filter: Filter<Doc> = {},
+  session?: Session,
+): Promise<Array<Record<string, any>>> {
+  const units = await col('units').find({ ...filter, account_id: accountId }, opts(session)).toArray();
+  if (units.length === 0) return [];
+  const unitIds = units.map((u) => u._id);
+
+  const [properties, agreements] = await Promise.all([
+    col('properties').find({ _id: { $in: [...new Set(units.map((u) => u.property_id))] } }, opts(session)).toArray(),
+    col('agreements')
+      .find({ account_id: accountId, unit_id: { $in: unitIds } }, opts(session))
+      .sort({ start_date: -1 })
+      .toArray(),
+  ]);
+  const propertyById = new Map(properties.map((p) => [p._id, p]));
+
+  const current = new Map<string, Doc>();
+  const upcoming = new Map<string, Doc>();
+  for (const a of agreements) {
+    // Sorted by start_date descending: the first match is the latest one.
+    if (!current.has(a.unit_id) && a.start_date <= today && (a.status === 'active' || (a.ended_on && a.ended_on >= today))) {
+      current.set(a.unit_id, a);
+    }
+    if (a.status === 'active' && a.start_date > today) {
+      const seen = upcoming.get(a.unit_id);
+      if (!seen || a.start_date < seen.start_date) upcoming.set(a.unit_id, a);
+    }
+  }
+
+  const tenantIds = [...new Set([...current.values(), ...upcoming.values()].map((a) => a.tenant_id))];
+  const tenants = new Map(
+    (tenantIds.length ? await col('tenants').find({ _id: { $in: tenantIds } }, opts(session)).toArray() : []).map((t) => [t._id, t]),
+  );
+
+  return units.map((u) => {
+    const p = propertyById.get(u.property_id);
+    const ca = current.get(u._id);
+    const ua = upcoming.get(u._id);
+    const ct = ca ? tenants.get(ca.tenant_id) : undefined;
+    const ut = ua ? tenants.get(ua.tenant_id) : undefined;
+    return {
+      id: u._id,
+      property_id: u.property_id,
+      name: u.name,
+      type: u.type,
+      floor: u.floor ?? null,
+      area_sqft: u.area_sqft ?? null,
+      default_rent: u.default_rent ?? null,
+      notes: u.notes ?? null,
+      archived_at: u.archived_at ?? null,
+      created_at: u.created_at,
+      updated_at: u.updated_at,
+      property_name: p?.name,
+      property_type: p?.type,
+      property_archived_at: p?.archived_at ?? null,
+      ca_id: ca?._id ?? null,
+      ca_rent_amount: ca?.rent_amount,
+      ca_billing_cycle: ca?.billing_cycle,
+      ca_due_day: ca?.due_day,
+      ca_gst_applicable: ca?.gst_applicable,
+      ca_gst_rate: ca?.gst_rate,
+      ca_security_deposit: ca?.security_deposit,
+      ca_start_date: ca?.start_date,
+      ca_end_date: ca?.end_date ?? null,
+      ca_ended_on: ca?.ended_on ?? null,
+      ca_billing_start_date: ca?.billing_start_date,
+      ca_escalation_percent: ca?.escalation_percent,
+      ca_escalation_interval_months: ca?.escalation_interval_months,
+      ca_escalation_base_date: ca?.escalation_base_date ?? null,
+      ca_prorate_partial_periods: ca?.prorate_partial_periods,
+      ct_id: ct?._id ?? null,
+      ct_name: ct?.name,
+      ct_phone: ct?.phone,
+      ct_business_name: ct?.business_name ?? null,
+      ua_id: ua?._id ?? null,
+      ua_start_date: ua?.start_date,
+      ut_id: ut?._id ?? null,
+      ut_name: ut?.name,
+      occupancy: (ca ? 'occupied' : ua ? 'reserved' : 'vacant') as Occupancy,
+    };
+  });
 }
 
 export interface UnitDto {

@@ -1,7 +1,7 @@
 import { createHmac, randomInt, timingSafeEqual } from 'node:crypto';
 import { config } from '../../config/env.js';
 import { logger } from '../../config/logger.js';
-import { db } from '../../db/knex.js';
+import { col, newId, withTransaction } from '../../db/mongo.js';
 import { now } from '../../lib/clock.js';
 import { AppError, Errors } from '../../lib/errors.js';
 import { maskPhone } from '../../lib/phone.js';
@@ -21,11 +21,10 @@ export interface OtpRequestResult {
 
 export async function requestOtp(phone: string, ip?: string): Promise<OtpRequestResult> {
   const current = now();
-  const recent = await db('otp_codes')
-    .where('phone', phone)
-    .where('created_at', '>', new Date(current.getTime() - 3_600_000))
-    .orderBy('created_at', 'desc')
-    .select('created_at');
+  const recent = await col('otp_codes')
+    .find({ phone, created_at: { $gt: new Date(current.getTime() - 3_600_000) } }, { projection: { created_at: 1 } })
+    .sort({ created_at: -1 })
+    .toArray();
 
   if (recent.length >= config.otp.maxPerHour) {
     throw Errors.tooMany('Too many codes requested for this number. Please try again in an hour.');
@@ -43,16 +42,22 @@ export async function requestOtp(phone: string, ip?: string): Promise<OtpRequest
   const code = config.otp.devCode ?? String(randomInt(0, 1_000_000)).padStart(6, '0');
   const expiresAt = new Date(current.getTime() + config.otp.ttlSeconds * 1000);
 
-  await db.transaction(async (trx) => {
+  await withTransaction(async (session) => {
     // Only the most recent code is valid.
-    await trx('otp_codes').where({ phone }).whereNull('consumed_at').update({ consumed_at: current });
-    await trx('otp_codes').insert({
-      phone,
-      code_hash: hashCode(phone, code),
-      expires_at: expiresAt,
-      ip: ip?.slice(0, 64) ?? null,
-      created_at: current,
-    });
+    await col('otp_codes').updateMany({ phone, consumed_at: null }, { $set: { consumed_at: current } }, { session });
+    await col('otp_codes').insertOne(
+      {
+        _id: newId(),
+        phone,
+        code_hash: hashCode(phone, code),
+        expires_at: expiresAt,
+        attempts: 0,
+        consumed_at: null,
+        ip: ip?.slice(0, 64) ?? null,
+        created_at: current,
+      },
+      { session },
+    );
   });
 
   const minutes = Math.round(config.otp.ttlSeconds / 60);
@@ -77,13 +82,8 @@ type VerifyOutcome = { kind: 'ok' } | { kind: 'expired' } | { kind: 'locked' } |
 export async function verifyOtp(phone: string, code: string): Promise<void> {
   // The transaction returns an outcome instead of throwing so that a failed
   // attempt is still committed (throwing would roll the counter back).
-  const outcome = await db.transaction<VerifyOutcome>(async (trx) => {
-    const row = await trx('otp_codes')
-      .where({ phone })
-      .whereNull('consumed_at')
-      .orderBy('created_at', 'desc')
-      .forUpdate()
-      .first();
+  const outcome = await withTransaction<VerifyOutcome>(async (session) => {
+    const row = await col('otp_codes').findOne({ phone, consumed_at: null }, { sort: { created_at: -1 }, session });
 
     if (!row || new Date(row.expires_at).getTime() <= now().getTime()) return { kind: 'expired' };
     if (row.attempts >= config.otp.maxAttempts) return { kind: 'locked' };
@@ -93,12 +93,13 @@ export async function verifyOtp(phone: string, code: string): Promise<void> {
     const matches = expected.length === actual.length && timingSafeEqual(expected, actual);
     const attempts = row.attempts + 1;
 
+    // Updating the row inside the transaction serialises concurrent attempts (write conflict -> retry).
     if (!matches) {
-      await trx('otp_codes').where({ id: row.id }).update({ attempts });
+      await col('otp_codes').updateOne({ _id: row._id }, { $set: { attempts } }, { session });
       return { kind: 'mismatch', attemptsLeft: config.otp.maxAttempts - attempts };
     }
 
-    await trx('otp_codes').where({ id: row.id }).update({ consumed_at: now(), attempts });
+    await col('otp_codes').updateOne({ _id: row._id }, { $set: { consumed_at: now(), attempts } }, { session });
     return { kind: 'ok' };
   });
 
