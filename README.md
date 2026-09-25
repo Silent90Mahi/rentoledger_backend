@@ -110,6 +110,29 @@ NODE_ENV=production MONGODB_URI=... JWT_ACCESS_SECRET=... OTP_SECRET=... npm run
 NODE_ENV=production ... npm start
 ```
 
+**Koyeb** (Docker build from GitHub + MongoDB Atlas):
+
+1. MongoDB Atlas → Network Access → add `0.0.0.0/0` (Koyeb has no fixed outbound IPs); Database Access → a user with
+   *readWrite* on the `rentoledger` database.
+2. Koyeb → Create Web Service → GitHub → this repository. Builder: **Dockerfile** (repository root). Instance: any.
+3. Port: `8000`, protocol HTTP, public path `/`. Health check: HTTP `GET /health` on port 8000.
+4. Environment variables (store the ones marked 🔒 as Koyeb **secrets**):
+
+   | Variable | Value |
+   |---|---|
+   | `MONGODB_URI` 🔒 | `mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/?retryWrites=true&w=majority` |
+   | `MONGODB_DB` | `rentoledger` |
+   | `JWT_ACCESS_SECRET` 🔒 | output of `openssl rand -hex 32` |
+   | `OTP_SECRET` 🔒 | output of `openssl rand -hex 32` |
+   | `PORT` | `8000` |
+   | `TRUST_PROXY` | `1` |
+   | `CORS_ORIGINS` | your web app's origin, e.g. `https://app.example.com` |
+   | `SMS_PROVIDER` + `TWILIO_*` 🔒 | real SMS; or temporarily `SMS_PROVIDER=console` with `ALLOW_CONSOLE_SMS_IN_PRODUCTION=true` (codes appear in Koyeb logs) |
+
+5. Deploy. Indexes are created on start-up; check `https://<app>.koyeb.app/ready`.
+   Optional demo data on an empty database: Koyeb → Service → Console → `node dist/src/db/cli.js seed --force`.
+6. Build the Flutter app with `--dart-define=API_BASE_URL=https://<app>.koyeb.app/api/v1`.
+
 Operational notes:
 
 - **Health:** `/health` (liveness) and `/ready` (checks the database) are unauthenticated and outside the API prefix.
