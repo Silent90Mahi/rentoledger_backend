@@ -24,6 +24,9 @@ async function main(): Promise<void> {
   if (config.auth.usingDevSecrets && !config.isTest) {
     logger.warn('Using built-in development secrets. Set JWT_ACCESS_SECRET and OTP_SECRET before deploying.');
   }
+  if (config.otp.demoMode) {
+    logger.warn('OTP_DEMO_MODE is on: sign-in codes are returned by the API. Anyone can sign in with any phone number. Turn it off before real users.');
+  }
   await waitForDatabase();
   // Idempotent: creates any missing collection index (the MongoDB equivalent of migrations).
   await ensureIndexes();

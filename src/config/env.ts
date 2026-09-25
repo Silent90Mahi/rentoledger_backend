@@ -49,6 +49,9 @@ const EnvSchema = z.object({
     .regex(/^\d{6}$/, 'DEV_OTP_CODE must be exactly 6 digits')
     .optional(),
   EXPOSE_DEV_OTP: booleanFlag(true),
+  // TEMPORARY, for demos before SMS is set up: return the sign-in code in the API response
+  // (the app then fills it in automatically). Anyone who knows a phone number can sign in as it.
+  OTP_DEMO_MODE: booleanFlag(false),
 
   SMS_PROVIDER: z.enum(['console', 'twilio']).default('console'),
   TWILIO_ACCOUNT_SID: z.string().optional(),
@@ -107,7 +110,7 @@ if (isProduction) {
     fail('OTP_SECRET must be set to a random string of at least 16 characters in production.');
   }
   if (env.DEV_OTP_CODE) fail('DEV_OTP_CODE must not be set in production.');
-  if (env.SMS_PROVIDER === 'console' && !env.ALLOW_CONSOLE_SMS_IN_PRODUCTION) {
+  if (env.SMS_PROVIDER === 'console' && !env.ALLOW_CONSOLE_SMS_IN_PRODUCTION && !env.OTP_DEMO_MODE) {
     fail('SMS_PROVIDER=console cannot deliver OTPs in production. Configure twilio or set ALLOW_CONSOLE_SMS_IN_PRODUCTION=true.');
   }
 }
@@ -162,7 +165,8 @@ export const config = {
     // Strict in production (SMS costs money); relaxed for local development and tests.
     maxPerHour: env.OTP_MAX_PER_HOUR ?? (isProduction ? 6 : 60),
     devCode: isProduction ? undefined : env.DEV_OTP_CODE,
-    exposeDevCode: !isProduction && env.EXPOSE_DEV_OTP && env.SMS_PROVIDER === 'console',
+    exposeDevCode: env.OTP_DEMO_MODE || (!isProduction && env.EXPOSE_DEV_OTP && env.SMS_PROVIDER === 'console'),
+    demoMode: env.OTP_DEMO_MODE,
   },
   sms: {
     provider: env.SMS_PROVIDER,

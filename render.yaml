@@ -26,3 +26,7 @@ services:
       # OTP codes only appear in Render's logs until you switch to Twilio (SMS_PROVIDER=twilio + TWILIO_* vars).
       - key: ALLOW_CONSOLE_SMS_IN_PRODUCTION
         value: "true"
+      # TEMPORARY: return sign-in codes in the API so the app fills them in. Anyone can sign in
+      # as any number while this is true. Set to "false" (or remove) before real users.
+      - key: OTP_DEMO_MODE
+        value: "true"
