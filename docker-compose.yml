@@ -1,0 +1,52 @@
+# Production-like stack for the API: PostgreSQL + RentOLedger API.
+#
+#   export JWT_ACCESS_SECRET=$(openssl rand -hex 32) OTP_SECRET=$(openssl rand -hex 32)
+#   docker compose up --build -d
+#   curl http://localhost:4000/ready
+#
+# Optional demo data (only on a fresh, empty database):
+#   docker compose exec api node dist/src/db/cli.js seed --force
+#
+# SMS: codes are written to the API log (`docker compose logs api`) until you set
+# SMS_PROVIDER=twilio with TWILIO_* credentials and ALLOW_CONSOLE_SMS_IN_PRODUCTION=false.
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: rentoledger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rentoledger}
+      POSTGRES_DB: rentoledger
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rentoledger -d rentoledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://rentoledger:${POSTGRES_PASSWORD:-rentoledger}@db:5432/rentoledger
+      DB_AUTO_MIGRATE: "true"
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Set JWT_ACCESS_SECRET, e.g. export JWT_ACCESS_SECRET=$$(openssl rand -hex 32)}
+      OTP_SECRET: ${OTP_SECRET:?Set OTP_SECRET, e.g. export OTP_SECRET=$$(openssl rand -hex 32)}
+      SMS_PROVIDER: ${SMS_PROVIDER:-console}
+      ALLOW_CONSOLE_SMS_IN_PRODUCTION: ${ALLOW_CONSOLE_SMS_IN_PRODUCTION:-true}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${API_PORT:-4000}:4000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
