@@ -1,0 +1,28 @@
+# Render Blueprint: Render → New → Blueprint → pick this repository.
+# Builds the Dockerfile and runs the API. Database: MongoDB Atlas (set MONGODB_URI when asked).
+services:
+  - type: web
+    name: rentoledger-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: MONGODB_URI # Atlas connection string; entered in the dashboard, never committed
+        sync: false
+      - key: MONGODB_DB
+        value: rentoledger
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: OTP_SECRET
+        generateValue: true
+      - key: TRUST_PROXY
+        value: "1"
+      - key: CORS_ORIGINS # your web app's address, e.g. https://app.example.com (optional)
+        sync: false
+      - key: SMS_PROVIDER
+        value: console
+      # OTP codes only appear in Render's logs until you switch to Twilio (SMS_PROVIDER=twilio + TWILIO_* vars).
+      - key: ALLOW_CONSOLE_SMS_IN_PRODUCTION
+        value: "true"
